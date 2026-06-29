@@ -228,7 +228,7 @@
 
 ## 多平台扩展口子
 
-未来多平台同一标的合并管理时，应区分两层 key：
+未来多平台同一标的合并管理时，应区分两层 key，并在收益计算前新增统一标的映射层：
 
 | 层 | 说明 |
 | --- | --- |
@@ -241,6 +241,13 @@
 2. lot / allocation 默认仍在 account + platform 维度内计算，避免跨券商税务和成本基础混淆。
 3. 若发生转仓，必须有 asset_transfer 链路，才允许把成本基础从一个平台延续到另一个平台。
 4. 未来税务 profile 可选择按账户、平台、税务主体或全组合聚合。
+
+补充规则：
+
+1. raw fact 层继续保留券商原始代码、原始名称和原始备注。
+2. instrument resolution / master data 层负责将 platform instrument 映射到 `canonical_instrument_id`。
+3. return calculation 必须把 `canonical_instrument_id`、`canonical_symbol`、`canonical_display_name` 写入 `return_items` 或 enriched view。
+4. 前端默认展示 canonical 字段，raw 字段只作为来源追溯和复核信息。
 
 ## 需要决策的问题
 

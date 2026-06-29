@@ -24,6 +24,26 @@
 
 ## 建议新增计算层
 
+### 先决条件：统一标的映射层
+
+在生成 `return_items` 之前，必须先完成 platform instrument 到 canonical instrument 的映射。前端不应该直接拼接 raw code / raw name 来展示标的。
+
+推荐链路：
+
+`raw fact -> instrument resolution / master data -> lot/allocation -> return_items -> frontend`
+
+最小字段要求：
+
+| 字段 | 说明 |
+| --- | --- |
+| `instrument_key` | 平台或来源表中的标的 key。 |
+| `canonical_instrument_id` | 系统统一标的 id。 |
+| `canonical_symbol` | 统一展示代码。 |
+| `canonical_display_name` | 统一展示名称。 |
+| `instrument_mapping_status` | `auto`, `manual_confirmed`, `needs_review`, `unmapped`。 |
+
+相关 schema：`schema/canonical_instrument_mapping_schema_v1.sql`。
+
 ### `return_treatment_profiles`
 
 收益口径定义表。第一版至少包含：
@@ -111,4 +131,4 @@
 5. 每个收益项能追溯 source table / source pk / source refs。
 6. 外部出入金不进入收益。
 7. 同一费用不能既进入 lot cost，又作为 period expense 重复统计。
-
+8. 标的列表和交易明细都使用 canonical instrument 字段；raw 字段只作为追溯信息。

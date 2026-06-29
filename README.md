@@ -46,9 +46,15 @@
 | `tools/` | 脱敏工具代码，不含真实数据。 |
 | `examples/` | 占位说明；不要放真实样本。 |
 
+## 最新补充：统一标的映射层
+
+前端和收益计算需要先把平台原始标的映射为 `canonical_instrument_id`，否则同一标的会在汇总和明细中显示成不同名称。相关文件：
+
+- `docs/decisions/2026-06-29-canonical-instrument-mapping-layer.md`
+- `schema/canonical_instrument_mapping_schema_v1.sql`
+
 ## 隐私原则
 
 如果一个文件可以反推出用户持仓、交易、收益、账户、结单文件名、路径或身份信息，就不要提交。
 
 更具体的规则见 `DATA_PRIVACY.md`。
-
