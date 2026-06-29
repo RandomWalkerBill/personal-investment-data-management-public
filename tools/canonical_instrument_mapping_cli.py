@@ -18,12 +18,49 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 DEFAULT_DB = WORKSPACE_ROOT / "exports" / "investment-db-v1" / "investment.sqlite"
 DEFAULT_SCHEMA = WORKSPACE_ROOT / "schema" / "canonical_instrument_mapping_schema_v1.sql"
+DEFAULT_NAME_SEEDS = WORKSPACE_ROOT / "config" / "instrument-name-seeds.local.json"
 
 HK_CODE_RE = re.compile(r"(?<!\d)(\d{4,5})(?!\d)")
 FUND_CODE_RE = re.compile(r"(HK\d{10})")
+NUMERIC_FUND_CODE_RE = re.compile(r"\b(8\d{5,6})\b")
 OPTION_CODE_RE = re.compile(r"^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d+)$")
 OPTION_CODE_ANY_RE = re.compile(r"([A-Z]+\d{6}[CP]\d+)")
 NOISY_NAME_MARKERS = ("保證金", "综合帳戶", "綜合帳戶", "10:", " 10:")
+EVENT_NAME_MARKERS = (
+    "IPO ALLOTMENT QTY",
+    "STOCK DIVIDEND",
+    "DISTRIBUTION IN SPECIE",
+    "SUBSCRIPTION RIGHTS",
+    "GIFT STOCK",
+    "SI IN",
+)
+
+def load_hkex_display_name_seeds(seed_path: Path = DEFAULT_NAME_SEEDS) -> dict[str, tuple[str, str]]:
+    """Load optional local display-name seeds without committing private symbols."""
+    def compact(value: Any) -> str:
+        return re.sub(r"\s+", " ", "" if value is None else str(value).replace("\n", " ")).strip()
+
+    if not seed_path.exists():
+        return {}
+    payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    seeds: dict[str, tuple[str, str]] = {}
+    for raw_code, value in payload.items():
+        code = str(raw_code).zfill(5)
+        if isinstance(value, dict):
+            display_name = compact(value.get("display_name"))
+            official_english_name = compact(value.get("official_english_name"))
+        elif isinstance(value, list) and value:
+            display_name = compact(value[0])
+            official_english_name = compact(value[1] if len(value) > 1 else "")
+        else:
+            display_name = compact(value)
+            official_english_name = ""
+        if display_name:
+            seeds[code] = (display_name, official_english_name)
+    return seeds
+
+
+HKEX_DISPLAY_NAME_SEEDS: dict[str, tuple[str, str]] = load_hkex_display_name_seeds()
 
 
 @dataclass(frozen=True)
@@ -83,12 +120,18 @@ def clean_name(raw_name: str | None, raw_symbol: str | None = None) -> str | Non
     name = normalize_text(raw_name)
     if not name:
         return None
-    if name.startswith("IPO Allotment Qty"):
+    upper_name = name.upper()
+    if any(marker in upper_name for marker in EVENT_NAME_MARKERS):
         return None
     leading_hk = re.match(r"^\d{4,5}\(([^)]+)\)", name)
     if leading_hk:
         return leading_hk.group(1).strip() or None
-    if raw_symbol and name == raw_symbol:
+    if raw_symbol:
+        raw_symbol_text = normalize_text(raw_symbol).upper()
+        name_code = name.upper().replace("HK:", "")
+        if name.upper() == raw_symbol_text or name_code.zfill(len(raw_symbol_text)) == raw_symbol_text:
+            return None
+    if re.fullmatch(r"\d{1,6}", name):
         return None
     if "(" in name and ")" in name:
         match = re.match(r"^[A-Z0-9.]+[\s]*\((.+)\)$", name)
@@ -107,6 +150,7 @@ def clean_name(raw_name: str | None, raw_symbol: str | None = None) -> str | Non
 def name_score(name: str | None, source_table: str) -> int:
     if not name:
         return 0
+    upper_name = name.upper()
     score = min(len(name), 40)
     if source_table in {"position_lots", "fund_position_lots", "short_stock_lots", "option_contract_lots"}:
         score += 40
@@ -114,9 +158,17 @@ def name_score(name: str | None, source_table: str) -> int:
         score += 25
     if any(marker in name for marker in NOISY_NAME_MARKERS):
         score -= 80
+    if any(marker in upper_name for marker in EVENT_NAME_MARKERS):
+        score -= 120
+    if re.fullmatch(r"\d{1,6}", name) or re.fullmatch(r"HK:\d{4,5}", upper_name):
+        score -= 120
     if re.fullmatch(r"[A-Z0-9.() -]+", name):
         score -= 10
     return score
+
+
+def hk_display_seed(hk_code: str) -> tuple[str, str] | None:
+    return HKEX_DISPLAY_NAME_SEEDS.get(hk_code.zfill(5))
 
 
 def hk_code_from_text(*values: str | None) -> str | None:
@@ -134,6 +186,9 @@ def fund_code_from_text(*values: str | None) -> str | None:
         match = FUND_CODE_RE.search(text)
         if match:
             return match.group(1)
+        numeric_match = NUMERIC_FUND_CODE_RE.search(text)
+        if numeric_match:
+            return numeric_match.group(1)
     return None
 
 
@@ -174,6 +229,9 @@ def canonical_for_stock(
     hk_code = hk_code_from_text(key_text, code_text, raw_name)
     if hk_code and (key_text.startswith("HK:") or market_text in {"SEHK", "HKEX", "HK"} or currency_text == "HKD"):
         platform_key = f"HK:{hk_code}"
+        seed = hk_display_seed(hk_code)
+        canonical_name = seed[0] if seed else clean_name(name_source, hk_code)
+        notes = f"HKEX stock list English name: {seed[1]}" if seed else None
         return Candidate(
             source_table=source_table,
             source_pk=platform_key,
@@ -184,11 +242,12 @@ def canonical_for_stock(
             instrument_type="stock_or_etf",
             canonical_id=f"HKEX:{hk_code}",
             canonical_symbol=f"HK:{hk_code}",
-            canonical_name=clean_name(name_source, hk_code),
+            canonical_name=canonical_name,
             canonical_type="stock_or_etf",
             primary_market="HKEX",
             listing_currency="HKD",
             confidence="high",
+            notes=notes,
         )
     symbol = code_text or key_text.replace("US:", "")
     if symbol and (key_text.startswith("US:") or market_text in {"US", "NASDAQ", "NYSE", "AMEX", "ARCA", "BATO", "JNST", "EDGX", "EDGO", "MCRY"} or currency_text == "USD"):
