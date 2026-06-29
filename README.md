@@ -52,6 +52,13 @@
 
 - `docs/decisions/2026-06-29-canonical-instrument-mapping-layer.md`
 - `schema/canonical_instrument_mapping_schema_v1.sql`
+- `tools/canonical_instrument_mapping_cli.py`
+
+本地私有数据库上可运行：
+
+```bash
+python tools/canonical_instrument_mapping_cli.py run --db-path "$INVESTMENT_DB_PATH" --reset
+```
 
 ## 隐私原则
 
