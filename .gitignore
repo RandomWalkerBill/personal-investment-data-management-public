@@ -1,0 +1,33 @@
+# Private data
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.ndjson
+*.raw.json
+
+# Generated/private folders
+cache/
+exports/
+work/
+tmp/
+staging/
+candidate/
+review/
+pdf-cache/
+parser-v1/
+lot-allocation-v1/
+
+# System/editor
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.env
+.env.*
+
