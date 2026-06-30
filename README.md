@@ -32,6 +32,7 @@
 3. 设计 `return_items`、`return_summary_*` 和 profile switch。
 4. 用本地私有数据库验证计算结果，但不要把私有数据库或派生金额提交到 Git。
 5. 前端先展示富途数据结构，预留 `canonical_instrument_id` 支持多平台同标的汇总。
+6. 多平台账户展示使用 `canonical_account_id` 和 `account_group_id`，不要直接用原始券商账号做汇总主键。
 
 ## 目录
 
@@ -59,6 +60,20 @@
 ```bash
 python tools/canonical_instrument_mapping_cli.py run --db-path "$INVESTMENT_DB_PATH" --reset
 ```
+
+## 最新补充：统一账户映射层
+
+账户维度分三层：
+
+- `accounts` / `statement_accounts`：原始平台账户和结单账户证据。
+- `canonical_accounts` / `canonical_account_mappings`：同一真实券商账户链路，处理账号升级、子账户合并和平台内部结构变化。
+- `account_groups` / `account_group_memberships`：跨平台、券商、组合、策略或税务视角的账户分组。
+
+相关 schema：
+
+- `schema/canonical_account_mapping_schema_v1.sql`
+
+前端展示交易明细时，可以读 `v_market_trades_with_accounts`、`v_fund_orders_with_accounts`、`v_cash_ledger_entries_with_accounts` 等 account enriched views，同时展示原始账户和统一账户。跨平台汇总时按 `canonical_account_id` join `v_account_group_memberships` 过滤。
 
 ## 隐私原则
 

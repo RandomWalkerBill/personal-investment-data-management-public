@@ -44,6 +44,34 @@
 
 相关 schema：`schema/canonical_instrument_mapping_schema_v1.sql`。
 
+### 先决条件：统一账户映射层
+
+多平台展示不能直接用券商原始账户号或子账户名做汇总主键。账户维度分三层：
+
+| 层 | 说明 |
+| --- | --- |
+| raw account | 平台 / 结单原始账户，用于追溯和对账。 |
+| canonical account | 同一真实券商账户链路，用于处理账户升级、子账户合并和单券商账户汇总。 |
+| account group | 多个 canonical account 的分组，用于跨平台、券商、组合、策略或税务视角筛选。 |
+
+前端明细优先读取 account enriched views，例如：
+
+- `v_market_trades_with_accounts`
+- `v_fund_orders_with_accounts`
+- `v_cash_ledger_entries_with_accounts`
+- `v_asset_movement_events_with_accounts`
+
+展示字段建议：
+
+| 字段 | 说明 |
+| --- | --- |
+| `raw_account_id` / `raw_account_label` | 原始账户证据。 |
+| `canonical_account_id` / `canonical_account_label` | 统一账户。 |
+| `canonical_account_platform` / `canonical_account_broker` | 平台 / 券商筛选。 |
+| `account_group_id` | 通过 `v_account_group_memberships` join 获得，用于跨平台分组筛选。 |
+
+相关 schema：`schema/canonical_account_mapping_schema_v1.sql`。
+
 ### `return_treatment_profiles`
 
 收益口径定义表。第一版至少包含：
@@ -85,6 +113,9 @@
 | `source_table` / `source_pk` | 来源引用。 |
 | `event_date` | 日期。 |
 | `account_id` | 账户。 |
+| `raw_account_id` | 原始账户 id。 |
+| `canonical_account_id` | 统一账户 id。 |
+| `account_group_id` | 可选，账户组筛选维度。 |
 | `platform_id` | 平台 / 券商。 |
 | `instrument_key` | 平台标的 key。 |
 | `canonical_instrument_id` | 未来多平台合并标的 id。 |
@@ -115,6 +146,9 @@
 | --- | --- |
 | platform instrument | 券商原始代码或合约 id。 |
 | canonical instrument | 系统统一标的 id，用于展示层合并。 |
+| raw account | 券商原始账户 / 子账户，用于追溯。 |
+| canonical account | 同一券商账户链路，用于处理账户升级。 |
+| account group | 跨平台汇总和筛选。 |
 
 默认规则：
 
