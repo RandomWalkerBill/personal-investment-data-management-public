@@ -30,6 +30,7 @@ DEFAULT_EXPORT_DIR = WORKSPACE_ROOT / "exports" / "investment-db-v1" / "lot-allo
 Q2 = Decimal("0.01")
 Q6 = Decimal("0.000001")
 IPO_ALLOTMENT_FEE_RATE = Decimal("0.010085")
+FUND_DUST_UNITS_TOLERANCE = Decimal("1")
 
 DATE_RE = re.compile(r"(20\d{2})[/-](\d{2})[/-](\d{2})")
 HK_CODE_AT_START_RE = re.compile(r"^\s*#?(\d{4,5})(?=\(|\b)")
@@ -38,6 +39,8 @@ US_SYMBOL_AT_START_RE = re.compile(r"^\s*([A-Z]{1,6})(?=\(|\b)")
 OPTION_CODE_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d+", re.IGNORECASE)
 OPTION_CODE_ANY_RE = re.compile(r"([A-Z]{1,6})(\d{6})([CP])(\d{3,7})", re.IGNORECASE)
 FUND_CODE_RE = re.compile(r"(HK\d{10})", re.IGNORECASE)
+NUMERIC_FUND_CODE_RE = re.compile(r"\b(8\d{5,6})\b")
+HK_STRUCTURED_PRODUCT_SUFFIX_RE = re.compile(r"\.[CP](?:\b|$)", re.IGNORECASE)
 
 
 def utc_now_iso() -> str:
@@ -102,7 +105,12 @@ def extract_dates(*parts: Any) -> list[str]:
 
 
 def period_start_date(period: str) -> str:
-    return f"{period[:4]}-{period[4:6]}-01"
+    normalized = text(period)
+    if len(normalized) == 4:
+        return f"{normalized}-01-01"
+    if len(normalized) >= 6:
+        return f"{normalized[:4]}-{normalized[4:6]}-01"
+    return normalized
 
 
 def clean_name(raw: str, code_or_symbol: str) -> str:
@@ -115,6 +123,14 @@ def clean_name(raw: str, code_or_symbol: str) -> str:
     value = value.replace(code_or_symbol, "", 1).strip()
     value = re.split(r"保證金|FUTU OTC|SEHK|XNDQ|JNST|BATO|MCRY|EDGO|AMXO|EDGX|MXOP|XISX", value)[0]
     return value.strip(" ()")
+
+
+def looks_like_hk_structured_product(*values: Any) -> bool:
+    """Identify HK warrants/CBBC-like products that use stock-style numeric codes."""
+    raw = " ".join(text(value) for value in values if text(value))
+    if not raw:
+        return False
+    return bool(HK_STRUCTURED_PRODUCT_SUFFIX_RE.search(raw))
 
 
 @dataclass
@@ -163,12 +179,13 @@ def infer_instrument(
     if hk_code:
         normalized = hk_code.zfill(5)
         name = clean_name(raw_parts[2] or raw_parts[0] or raw_parts[1], hk_code)
+        inferred_type = "hk_structured_product" if looks_like_hk_structured_product(raw_joined, name) else "stock_or_etf"
         return Instrument(
             key=f"HK:{normalized}",
             code=normalized,
             name=name or None,
             market="HK",
-            inferred_type="stock_or_etf",
+            inferred_type=inferred_type,
             eligible_long_equity=True,
         )
 
@@ -239,6 +256,8 @@ class CloseEvent:
     quantity: Decimal
     proceeds: Decimal
     notes: str | None = None
+    proceeds_policy: str = "provided"
+    pnl_status_override: str | None = None
 
 
 @dataclass
@@ -404,11 +423,15 @@ def infer_fund_instrument(*, code_raw: Any = None, name_raw: Any = None, currenc
         if match:
             code = match.group(1).upper()
             break
+        numeric_match = NUMERIC_FUND_CODE_RE.search(part)
+        if numeric_match:
+            code = numeric_match.group(1)
+            break
     if code is None:
         return None
 
     raw_name = text(name_raw) or text(code_raw)
-    name = FUND_CODE_RE.sub("", raw_name).strip()
+    name = NUMERIC_FUND_CODE_RE.sub("", FUND_CODE_RE.sub("", raw_name)).strip()
     if name.startswith("(") and name.endswith(")"):
         name = name[1:-1].strip()
     name = name.strip(" ()")
@@ -477,11 +500,22 @@ def infer_contract_multiplier(row: sqlite3.Row) -> Decimal | None:
 
 
 class LotAllocator:
-    def __init__(self, conn: sqlite3.Connection, allocation_run_id: str, import_run_id: str, account_id: str):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        allocation_run_id: str,
+        import_run_ids: Iterable[str],
+        account_id: str,
+        statement_ids: Iterable[str] | None = None,
+    ):
         self.conn = conn
         self.run_id = allocation_run_id
-        self.import_run_id = import_run_id
+        self.import_run_ids = tuple(import_run_ids)
+        if not self.import_run_ids:
+            raise ValueError("LotAllocator requires at least one import_run_id.")
+        self.import_run_id = ",".join(self.import_run_ids)
         self.account_id = account_id
+        self.statement_ids = tuple(sorted(set(statement_ids or [])))
         self.lots: list[Lot] = []
         self.close_events: list[CloseEvent] = []
         self.allocations: list[dict[str, Any]] = []
@@ -513,6 +547,36 @@ class LotAllocator:
     def next_id(self, prefix: str) -> str:
         self.sequence[prefix] += 1
         return f"{prefix}_{self.sequence[prefix]:04d}"
+
+    def fact_where_clause(self) -> tuple[str, tuple[Any, ...]]:
+        import_placeholders = ", ".join("?" for _ in self.import_run_ids)
+        clauses = [f"import_run_id IN ({import_placeholders})"]
+        params: list[Any] = list(self.import_run_ids)
+        if self.statement_ids:
+            statement_placeholders = ", ".join("?" for _ in self.statement_ids)
+            clauses.append(f"statement_id IN ({statement_placeholders})")
+            params.extend(self.statement_ids)
+        return " AND ".join(clauses), tuple(params)
+
+    def first_period(self) -> str:
+        where, params = self.fact_where_clause()
+        row = self.conn.execute(f"SELECT MIN(period) FROM raw_statements WHERE {where}", params).fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError(f"No raw statements found for allocation scope: {self.import_run_id} / {self.account_id}")
+        return row[0]
+
+    def latest_period(self) -> str:
+        where, params = self.fact_where_clause()
+        row = self.conn.execute(f"SELECT MAX(period) FROM raw_statements WHERE {where}", params).fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError(f"No raw statements found for allocation scope: {self.import_run_id} / {self.account_id}")
+        return row[0]
+
+    def source_pk(self, row: sqlite3.Row, pk_col: str) -> str:
+        raw_pk = text(row[pk_col])
+        if len(self.import_run_ids) > 1:
+            return f"{row['import_run_id']}:{raw_pk}"
+        return raw_pk
 
     def add_validation(
         self,
@@ -576,23 +640,21 @@ class LotAllocator:
         )
 
     def load_opening_lots(self) -> None:
-        first_period = self.conn.execute(
-            "SELECT MIN(period) FROM raw_statements WHERE import_run_id = ?",
-            (self.import_run_id,),
-        ).fetchone()[0]
+        first_period = self.first_period()
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM position_snapshots
-            WHERE import_run_id = ?
+            WHERE {where}
               AND period = ?
               AND snapshot_type = 'opening'
-              AND asset_category = 'stock_or_option'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
               AND quantity IS NOT NULL
               AND quantity > 0
             ORDER BY code_name, page, table_index, row_index
             """,
-            (self.import_run_id, first_period),
+            (*params, first_period),
         ).fetchall()
         for row in rows:
             inst = infer_instrument(
@@ -642,37 +704,407 @@ class LotAllocator:
             self.add_component(lot, "opening_market_value", market_value, "position_snapshots", lot.source_pk, None)
             self.add_lot(lot)
 
+    def first_period_equity_quantity_changes(self, first_period: str) -> dict[str, Decimal]:
+        where, params = self.fact_where_clause()
+        changes: dict[str, Decimal] = {}
+
+        trade_rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM market_trades
+            WHERE {where}
+              AND period = ?
+            ORDER BY trade_date, trade_id
+            """,
+            (*params, first_period),
+        ).fetchall()
+        for row in trade_rows:
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_symbol"],
+                name_raw=row["instrument_name_raw"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["instrument_type"],
+            )
+            if not inst.eligible_long_equity or not inst.key:
+                continue
+            side = text(row["side"]).lower()
+            position_effect = text(row["position_effect"]).lower()
+            quantity = dec(row["quantity"])
+            if side == "buy" and position_effect == "open":
+                changes[inst.key] = changes.get(inst.key, Decimal("0")) + quantity
+            elif side == "sell" and position_effect == "close":
+                changes[inst.key] = changes.get(inst.key, Decimal("0")) - quantity
+
+        movement_rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM asset_movement_events
+            WHERE {where}
+              AND period = ?
+              AND business_type = 'asset_movement'
+              AND quantity IS NOT NULL
+            ORDER BY event_date, asset_movement_id
+            """,
+            (*params, first_period),
+        ).fetchall()
+        for row in movement_rows:
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_code_raw"],
+                name_raw=row["description_raw"],
+                market="HK" if text(row["currency"]).upper() == "HKD" else None,
+                currency=row["currency"],
+            )
+            if not inst.eligible_long_equity or not inst.key:
+                continue
+            changes[inst.key] = changes.get(inst.key, Decimal("0")) + dec(row["quantity"])
+
+        return changes
+
+    def load_account_inception_lots_from_first_ending(self) -> None:
+        first_period = self.first_period()
+        where, params = self.fact_where_clause()
+        opening_rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM position_snapshots
+            WHERE {where}
+              AND period = ?
+              AND snapshot_type = 'opening'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+            """,
+            (*params, first_period),
+        ).fetchall()
+        opening_keys: set[str] = set()
+        for row in opening_rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if inst.eligible_long_equity and inst.key:
+                opening_keys.add(inst.key)
+
+        quantity_changes = self.first_period_equity_quantity_changes(first_period)
+        ending_rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM position_snapshots
+            WHERE {where}
+              AND period = ?
+              AND snapshot_type = 'ending'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+            ORDER BY code_name, page, table_index, row_index
+            """,
+            (*params, first_period),
+        ).fetchall()
+        for row in ending_rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            source_pk = f"{row['statement_id']}|{row['page']}|{row['table_index']}|{row['row_index']}"
+            if not inst.eligible_long_equity or not inst.key:
+                continue
+            if inst.key in opening_keys:
+                continue
+
+            ending_quantity = dec(row["quantity"])
+            net_change = quantity_changes.get(inst.key, Decimal("0"))
+            inception_quantity = q6(ending_quantity - net_change)
+            if inception_quantity <= Q6:
+                continue
+
+            if text(row["price"]):
+                inferred_cost = q2(inception_quantity * dec(row["price"]))
+            else:
+                inferred_cost = q2(dec(row["market_value"]) * inception_quantity / ending_quantity)
+            lot = Lot(
+                lot_id=self.next_id("lot"),
+                account_id=self.account_id,
+                instrument_key=inst.key,
+                instrument_code=inst.code,
+                instrument_name=inst.name,
+                market=inst.market,
+                currency=text(row["currency"]).upper(),
+                source_type="account_inception_position",
+                source_table="position_snapshots",
+                source_pk=source_pk,
+                source_ref=None,
+                open_date=period_start_date(first_period),
+                settlement_date=None,
+                original_quantity=inception_quantity,
+                remaining_quantity=inception_quantity,
+                remaining_cost=inferred_cost,
+                cost_basis_total=inferred_cost,
+                cost_basis_principal=inferred_cost,
+                cost_basis_fee=Decimal("0"),
+                cost_basis_status="provisional",
+                cost_basis_source="first_statement_ending_market_value_inferred_account_inception",
+                notes=(
+                    "首份结单无期初持仓表；按首月期末持仓扣除首月净买入/净转入后的残量"
+                    "生成账户初始 lot。成本按首月期末市值估算，只用于连续性和临时收益口径。"
+                ),
+            )
+            self.add_component(
+                lot,
+                "account_inception_market_value",
+                inferred_cost,
+                "position_snapshots",
+                source_pk,
+                None,
+                formula="first_period_inception_quantity * first_period_ending_price",
+                notes="首张可用结单边界估算成本，非最终税务成本。",
+            )
+            self.add_lot(lot)
+            self.add_validation(
+                check_code="account_inception_position_lot",
+                status="skipped",
+                severity="warning",
+                instrument_key=inst.key,
+                source_table="position_snapshots",
+                source_pk=source_pk,
+                expected_value=ending_quantity,
+                actual_value=inception_quantity,
+                diff_value=net_change,
+                message=f"{inst.key} 已根据首份结单期末持仓生成账户初始 lot。",
+                notes="该 lot 解决数量连续性；真实历史成本如需税务级精度仍需人工确认。",
+            )
+
+    def first_seen_periods_by_instrument(self) -> dict[str, str]:
+        where, params = self.fact_where_clause()
+        first_seen: dict[str, str] = {}
+
+        snapshot_rows = self.conn.execute(
+            f"""
+            SELECT period, code_name, market, currency, asset_category
+            FROM position_snapshots
+            WHERE {where}
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+            ORDER BY period
+            """,
+            params,
+        ).fetchall()
+        for row in snapshot_rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if inst.eligible_long_equity and inst.key:
+                period = text(row["period"])
+                first_seen[inst.key] = min(first_seen.get(inst.key, period), period)
+
+        trade_rows = self.conn.execute(
+            f"""
+            SELECT period, instrument_code_raw, instrument_symbol, instrument_name_raw, market, currency, instrument_type
+            FROM market_trades
+            WHERE {where}
+              AND period IS NOT NULL
+            ORDER BY period
+            """,
+            params,
+        ).fetchall()
+        for row in trade_rows:
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_symbol"],
+                name_raw=row["instrument_name_raw"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["instrument_type"],
+            )
+            if inst.eligible_long_equity and inst.key:
+                period = text(row["period"])
+                first_seen[inst.key] = min(first_seen.get(inst.key, period), period)
+
+        movement_rows = self.conn.execute(
+            f"""
+            SELECT period, instrument_code_raw, currency, description_raw
+            FROM asset_movement_events
+            WHERE {where}
+              AND period IS NOT NULL
+              AND quantity IS NOT NULL
+            ORDER BY period
+            """,
+            params,
+        ).fetchall()
+        for row in movement_rows:
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_code_raw"],
+                name_raw=row["description_raw"],
+                market="HK" if text(row["currency"]).upper() == "HKD" else None,
+                currency=row["currency"],
+            )
+            if inst.eligible_long_equity and inst.key:
+                period = text(row["period"])
+                first_seen[inst.key] = min(first_seen.get(inst.key, period), period)
+
+        return first_seen
+
+    def load_first_observed_opening_lots(self) -> None:
+        first_period = self.first_period()
+        first_seen = self.first_seen_periods_by_instrument()
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM position_snapshots
+            WHERE {where}
+              AND snapshot_type = 'opening'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+            ORDER BY period, code_name, page, table_index, row_index
+            """,
+            params,
+        ).fetchall()
+        loaded_keys: set[str] = set()
+        for row in rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if not inst.eligible_long_equity or not inst.key:
+                continue
+            period = text(row["period"])
+            if period == first_period:
+                continue
+            if first_seen.get(inst.key) != period:
+                continue
+            if inst.key in loaded_keys:
+                continue
+            quantity = dec(row["quantity"])
+            market_value = q2(dec(row["market_value"]))
+            source_pk = f"{row['statement_id']}|{row['page']}|{row['table_index']}|{row['row_index']}"
+            lot = Lot(
+                lot_id=self.next_id("lot"),
+                account_id=self.account_id,
+                instrument_key=inst.key,
+                instrument_code=inst.code,
+                instrument_name=inst.name,
+                market=inst.market,
+                currency=text(row["currency"]).upper(),
+                source_type="first_observed_opening_position",
+                source_table="position_snapshots",
+                source_pk=source_pk,
+                source_ref=None,
+                open_date=period_start_date(period),
+                settlement_date=None,
+                original_quantity=quantity,
+                remaining_quantity=quantity,
+                remaining_cost=market_value,
+                cost_basis_total=market_value,
+                cost_basis_principal=market_value,
+                cost_basis_fee=Decimal("0"),
+                cost_basis_status="provisional",
+                cost_basis_source="first_observed_statement_opening_market_value",
+                notes="该标的首次出现在当前数据范围时已有期初持仓；按该期 opening 市值生成边界 lot。",
+            )
+            self.add_component(
+                lot,
+                "first_observed_opening_market_value",
+                market_value,
+                "position_snapshots",
+                source_pk,
+                None,
+                notes="多账户/多市场分段接入时的边界估算成本，非最终税务成本。",
+            )
+            self.add_lot(lot)
+            loaded_keys.add(inst.key)
+            self.add_validation(
+                check_code="first_observed_opening_position_lot",
+                status="skipped",
+                severity="warning",
+                instrument_key=inst.key,
+                source_table="position_snapshots",
+                source_pk=source_pk,
+                expected_value=quantity,
+                actual_value=quantity,
+                diff_value=Decimal("0"),
+                message=f"{inst.key} 已根据首次出现期的 opening snapshot 生成边界 lot。",
+                notes="该 lot 解决分段数据接入的数量连续性；真实买入成本如需税务级精度仍需人工确认。",
+            )
+
     def handling_fee_rows_for_ipo(self, hk_code: str) -> list[sqlite3.Row]:
+        where, params = self.fact_where_clause()
         return self.conn.execute(
-            """
-            SELECT cash_entry_id, amount, source_refs
+            f"""
+            SELECT import_run_id, cash_entry_id, amount, source_refs
             FROM cash_ledger_entries
-            WHERE import_run_id = ?
+            WHERE {where}
               AND business_type = 'ipo_subscription'
               AND cash_leg_type = 'application_handling_fee'
               AND description LIKE ?
             ORDER BY period, event_date, cash_entry_id
             """,
-            (self.import_run_id, f"%#{hk_code}%"),
+            (*params, f"%#{hk_code}%"),
         ).fetchall()
 
+    def annual_ipo_cash_rows(self, hk_code: str) -> list[sqlite3.Row]:
+        where, params = self.fact_where_clause()
+        return self.conn.execute(
+            f"""
+            SELECT import_run_id, cash_entry_id, amount, source_refs, description
+            FROM cash_ledger_entries
+            WHERE {where}
+              AND description LIKE ?
+              AND (
+                description LIKE '%IPO Application Amount%'
+                OR description LIKE '%IPO Application Handling Fee%'
+                OR description LIKE '%IPO Refund Amount%'
+              )
+            ORDER BY period, event_date, cash_entry_id
+            """,
+            (*params, f"%#{hk_code}%"),
+        ).fetchall()
+
+    def derived_annual_ipo_cost(self, hk_code: str) -> tuple[Decimal, str | None, str | None]:
+        rows = self.annual_ipo_cash_rows(hk_code)
+        net_cash = q2(sum((dec(row["amount"]) for row in rows), Decimal("0")))
+        if net_cash >= 0:
+            return Decimal("0"), None, None
+        source_pk = ",".join(self.source_pk(row, "cash_entry_id") for row in rows)
+        source_refs = ",".join(text(row["source_refs"]) for row in rows if text(row["source_refs"]))
+        return abs(net_cash), source_pk or None, source_refs or None
+
     def load_ipo_allotment_lots(self) -> None:
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM asset_movement_events
-            WHERE import_run_id = ?
-              AND business_type = 'ipo_subscription'
-              AND asset_movement_type = 'allotment'
+            WHERE {where}
+              AND (
+                (
+                  business_type = 'ipo_subscription'
+                  AND asset_movement_type = 'allotment'
+                )
+                OR description_raw LIKE 'IPO Allotment Qty%'
+              )
               AND quantity IS NOT NULL
               AND quantity > 0
-              AND amount IS NOT NULL
-              AND amount > 0
             ORDER BY event_date, asset_movement_id
             """,
-            (self.import_run_id,),
+            params,
         ).fetchall()
         for row in rows:
+            source_pk = self.source_pk(row, "asset_movement_id")
             inst = infer_instrument(
                 code_raw=row["description_raw"] or row["instrument_code_raw"],
                 symbol=row["instrument_code_raw"],
@@ -685,17 +1117,26 @@ class LotAllocator:
                     status="failed",
                     severity="error",
                     source_table="asset_movement_events",
-                    source_pk=row["asset_movement_id"],
+                    source_pk=source_pk,
                     message=f"IPO 中签配发无法识别标的：{row['description_raw']}",
                 )
                 continue
 
             quantity = dec(row["quantity"])
-            principal = q2(dec(row["amount"]))
-            handling_fee_rows = self.handling_fee_rows_for_ipo(inst.code)
-            handling_fee = q2(sum((abs(dec(fee_row["amount"])) for fee_row in handling_fee_rows), Decimal("0")))
-            hidden_fee = q2(principal * IPO_ALLOTMENT_FEE_RATE)
-            total_cost = q2(principal + handling_fee + hidden_fee)
+            if row["amount"] is not None and dec(row["amount"]) > 0:
+                principal = q2(dec(row["amount"]))
+                handling_fee_rows = self.handling_fee_rows_for_ipo(inst.code)
+                handling_fee = q2(sum((abs(dec(fee_row["amount"])) for fee_row in handling_fee_rows), Decimal("0")))
+                hidden_fee = q2(principal * IPO_ALLOTMENT_FEE_RATE)
+                total_cost = q2(principal + handling_fee + hidden_fee)
+                cost_basis_source = "ipo_allotment_amount_plus_explicit_handling_fee_plus_formula_fee"
+            else:
+                principal, annual_cash_source_pk, annual_cash_source_refs = self.derived_annual_ipo_cost(inst.code)
+                handling_fee_rows = []
+                handling_fee = Decimal("0")
+                hidden_fee = Decimal("0")
+                total_cost = principal
+                cost_basis_source = "annual_ipo_cash_legs_net_cost"
             event_date = normalize_date(row["event_date"]) or (extract_dates(row["description_raw"])[0] if extract_dates(row["description_raw"]) else None)
 
             lot = Lot(
@@ -708,7 +1149,7 @@ class LotAllocator:
                 currency=text(row["currency"]).upper(),
                 source_type="ipo_allotment",
                 source_table="asset_movement_events",
-                source_pk=row["asset_movement_id"],
+                source_pk=source_pk,
                 source_ref=row["source_ref"],
                 open_date=event_date,
                 settlement_date=None,
@@ -719,17 +1160,28 @@ class LotAllocator:
                 cost_basis_principal=principal,
                 cost_basis_fee=q2(handling_fee + hidden_fee),
                 cost_basis_status="final",
-                cost_basis_source="ipo_allotment_amount_plus_explicit_handling_fee_plus_formula_fee",
-                notes="IPO 中签 lot；融资利息按期间费用保留，未分摊到 lot。",
+                cost_basis_source=cost_basis_source,
+                notes="IPO 中签 lot；年度账单缺配发金额时使用 IPO 申购款、手续费、退款现金腿净额。",
             )
-            self.add_component(lot, "ipo_allotment_principal", principal, "asset_movement_events", row["asset_movement_id"], row["source_ref"])
+            if row["amount"] is not None and dec(row["amount"]) > 0:
+                self.add_component(lot, "ipo_allotment_principal", principal, "asset_movement_events", source_pk, row["source_ref"])
+            elif principal:
+                self.add_component(
+                    lot,
+                    "annual_ipo_net_cash_cost",
+                    principal,
+                    "cash_ledger_entries",
+                    annual_cash_source_pk,
+                    annual_cash_source_refs,
+                    notes="年度账单未给配发金额，使用申购款 + 申购费 - 退款的净现金成本。",
+                )
             if handling_fee:
                 self.add_component(
                     lot,
                     "application_handling_fee",
                     handling_fee,
                     "cash_ledger_entries",
-                    ",".join(fee_row["cash_entry_id"] for fee_row in handling_fee_rows),
+                    ",".join(self.source_pk(fee_row, "cash_entry_id") for fee_row in handling_fee_rows),
                     ",".join(text(fee_row["source_refs"]) for fee_row in handling_fee_rows if text(fee_row["source_refs"])),
                 )
             else:
@@ -739,7 +1191,7 @@ class LotAllocator:
                     severity="info",
                     instrument_key=inst.key,
                     source_table="asset_movement_events",
-                    source_pk=row["asset_movement_id"],
+                    source_pk=source_pk,
                     expected_value=Decimal("0"),
                     actual_value=Decimal("0"),
                     diff_value=Decimal("0"),
@@ -750,12 +1202,657 @@ class LotAllocator:
                 "ipo_allotment_fee_or_levy",
                 hidden_fee,
                 "asset_movement_events",
-                row["asset_movement_id"],
+                source_pk,
                 row["source_ref"],
                 formula="allotment_amount * 0.010085",
                 notes="富途 IPO 中签 1% 手续费 + 约 0.0085% 小额市场/政府费用的合并口径。",
             )
             self.add_lot(lot)
+
+    def classify_asset_movement_lot(self, description: str) -> tuple[str, str]:
+        upper = description.upper()
+        if "STOCK DIVIDEND" in upper or "DISTRIBUTION IN SPECIE" in upper:
+            return "corporate_action_stock_distribution", "corporate_action_asset_movement_cost_unknown"
+        if "SUBSCRIPTION RIGHTS" in upper:
+            return "corporate_action_subscription_rights_settlement", "corporate_action_rights_cost_unknown"
+        if "RSU" in upper:
+            return "employee_equity_rsu_vest", "employee_equity_fmv_pending"
+        if "GIFT STOCK" in upper:
+            return "broker_reward_stock", "broker_reward_cost_unknown"
+        if upper.strip() == "SI IN" or " SI IN" in upper:
+            return "external_asset_transfer_in", "external_transfer_cost_unknown"
+        return "asset_movement_in", "asset_movement_cost_unknown"
+
+    def rsu_offer_key(self, description: str) -> str | None:
+        match = re.search(r"(T-RSU-Offer-\d+)", text(description), re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def manual_rsu_vesting_cost(self, source_pk: str, description: str) -> dict[str, Any] | None:
+        offer_key = self.rsu_offer_key(description)
+        filters = ["me.source_ref = ?"]
+        params: list[Any] = [source_pk]
+        if offer_key:
+            filters.append("me.description LIKE ?")
+            params.append(f"%{offer_key}%")
+        row = self.conn.execute(
+            f"""
+            SELECT
+              me.manual_event_id,
+              me.event_date AS vesting_date,
+              me.amount AS total_cost,
+              me.description,
+              me.source_label,
+              me.source_ref,
+              me.notes AS event_notes,
+              ml.quantity AS net_quantity,
+              ml.unit_price AS unit_price,
+              ml.amount AS leg_amount,
+              ml.notes AS leg_notes
+            FROM manual_events me
+            JOIN manual_event_legs ml
+              ON ml.manual_event_id = me.manual_event_id
+             AND ml.leg_role = 'net_shares_received'
+            WHERE me.status = 'active'
+              AND me.business_type = 'employee_equity'
+              AND me.event_subtype = 'rsu_vest'
+              AND ({' OR '.join(filters)})
+            ORDER BY me.event_date, me.manual_event_id
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        quantity = q6(dec(row["net_quantity"]))
+        total = q2(dec(row["total_cost"]) if text(row["total_cost"]) else dec(row["leg_amount"]))
+        unit_price = dec(row["unit_price"])
+        notes = (
+            f"RSU 成本已按用户确认到账日口径补录：到账数量 {decimal_key(quantity)} * "
+            f"腾讯控股收盘价 {decimal_key(unit_price)}。{text(row['event_notes'])}"
+        ).strip()
+        return {
+            "quantity": quantity,
+            "total": total,
+            "principal": total,
+            "fee": Decimal("0"),
+            "status": "final",
+            "source": "user_input_rsu_arrival_date_close_price",
+            "notes": notes,
+            "components": [
+                (
+                    "rsu_vesting_fmv_cost",
+                    total,
+                    "manual_events",
+                    row["manual_event_id"],
+                    row["source_label"],
+                    "net_shares_received * close_price",
+                    row["leg_notes"] or "RSU 到账日收盘价成本。",
+                )
+            ],
+            "validation": {
+                "check_code": "rsu_vesting_manual_cost_applied",
+                "source_table": "manual_events",
+                "source_pk": row["manual_event_id"],
+                "expected_value": None,
+                "actual_value": quantity,
+                "diff_value": None,
+                "message": f"{source_pk} 已应用 RSU 人工归属成本。",
+                "notes": notes,
+            },
+        }
+
+    def has_manual_rsu_vesting_for_offer(self, description: str) -> bool:
+        offer_key = self.rsu_offer_key(description)
+        if not offer_key:
+            return False
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM manual_events
+            WHERE status = 'active'
+              AND business_type = 'employee_equity'
+              AND event_subtype = 'rsu_vest'
+              AND description LIKE ?
+            LIMIT 1
+            """,
+            (f"%{offer_key}%",),
+        ).fetchone()
+        return row is not None
+
+    def classify_asset_movement_removal(self, row: sqlite3.Row, inst: Instrument | None = None) -> tuple[str, str | None, str]:
+        description = text(row["description_raw"])
+        upper = description.upper()
+        if "ACCOUNT UPGRADE" in upper:
+            return "skip", None, "账户升级在 owner 级口径下不改变总持仓，忽略同日账户间搬移。"
+        if "REVERSE IPO ALLOTMENT" in upper or text(row["business_type"]) == "ipo_subscription":
+            return "provided", None, "IPO 中签撤回 / 取消上市，按资产反向流水关闭中签 lot。"
+        if "SUBSCRIPTION RIGHTS" in upper:
+            return "skip", None, "供股权/认购权自身的减少只是权利结转；最终落股成本已在目标股票 lot 中按认购现金和手续费确认。"
+        if (inst and inst.inferred_type == "hk_structured_product") or "HOLDING_REMOVAL" in upper or "PAYMENT FOLLOWING MCE" in upper:
+            return "provided", None, "港股权证/牛熊证到期、强赎或失效，按同日同代码净现金腿作为 proceeds；无现金腿则按 0 proceeds 归零。"
+        if upper.strip() == "SI OUT" or " SI OUT" in upper:
+            return "cost_basis_transfer", "non_taxable_transfer", "外部转出只迁移持仓和成本，不确认为市场卖出收益。"
+        if "RSU TAX STOCK" in upper:
+            if self.has_manual_rsu_vesting_for_offer(description):
+                return "skip", None, "该 RSU 事件已按到账数量建 lot，扣税股不再单独关闭 lot。"
+            return "cost_basis_transfer", "non_taxable_withholding", "RSU 扣税股只移出投资持仓，不确认为市场卖出收益。"
+        if text(row["asset_movement_type"]).lower() in {"withdrawal", "out"}:
+            return "cost_basis_transfer", "non_taxable_transfer", "资产减少流水按成本迁移处理，不确认为市场卖出收益。"
+        return "cost_basis_transfer", "non_taxable_transfer", "未细分的资产减少流水先按成本迁移处理，保留原始备注供复核。"
+
+    def asset_movement_removal_cash_proceeds(self, row: sqlite3.Row, inst: Instrument) -> Decimal:
+        if not inst.code:
+            return Decimal("0")
+        event_date = normalize_date(row["event_date"])
+        cash_rows = self.conn.execute(
+            """
+            SELECT event_date, amount
+            FROM cash_ledger_entries
+            WHERE import_run_id = ?
+              AND statement_id = ?
+              AND description LIKE ?
+            ORDER BY event_date, cash_entry_id
+            """,
+            (row["import_run_id"], row["statement_id"], f"%{inst.code.lstrip('0') or inst.code}%"),
+        ).fetchall()
+        total = Decimal("0")
+        for cash_row in cash_rows:
+            cash_date = normalize_date(cash_row["event_date"])
+            if event_date and cash_date and cash_date != event_date:
+                continue
+            total += dec(cash_row["amount"])
+        return q2(total)
+
+    def cash_rows_for_subscription_rights(self, row: sqlite3.Row, target_code: str) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        code = target_code.lstrip("0") or target_code
+        final_date = normalize_date(row["event_date"])
+        start_date = final_date
+        scrip_row = self.conn.execute(
+            """
+            SELECT event_date
+            FROM asset_movement_events
+            WHERE import_run_id = ?
+              AND statement_id = ?
+              AND description_raw LIKE 'Scrip Issued by%'
+              AND description_raw LIKE ?
+            ORDER BY event_date
+            LIMIT 1
+            """,
+            (row["import_run_id"], row["statement_id"], f"%{code}%"),
+        ).fetchone()
+        if scrip_row is not None:
+            start_date = normalize_date(scrip_row["event_date"]) or start_date
+
+        cash_rows = self.conn.execute(
+            """
+            SELECT import_run_id, cash_entry_id, event_date, amount, source_refs, description
+            FROM cash_ledger_entries
+            WHERE import_run_id = ?
+              AND statement_id = ?
+              AND amount < 0
+            ORDER BY event_date, cash_entry_id
+            """,
+            (row["import_run_id"], row["statement_id"]),
+        ).fetchall()
+        principal_rows: list[sqlite3.Row] = []
+        fee_rows: list[sqlite3.Row] = []
+        for cash_row in cash_rows:
+            cash_date = normalize_date(cash_row["event_date"])
+            if start_date and cash_date and cash_date < start_date:
+                continue
+            if final_date and cash_date and cash_date > final_date:
+                continue
+            description = text(cash_row["description"]).upper()
+            if "SUBSCRIPTION RIGHTS AMOUNT" in description and code in description:
+                principal_rows.append(cash_row)
+            elif description.startswith("HANDLING CHARGE") and code in description and "SUBSCRIPTION" not in description:
+                fee_rows.append(cash_row)
+        return principal_rows, fee_rows
+
+    def parent_distribution_terms(self, description: str) -> tuple[str | None, Decimal | None]:
+        upper = description.upper()
+        match = re.search(r"(\d{3,5})\.HK\s+STOCK DIVIDEND\s+(\d{3,5})\.HK\s+1\s+FOR\s+(\d+)", upper)
+        if match:
+            return match.group(1).zfill(5), Decimal(match.group(3))
+        if "DISTRIBUTION IN SPECIE" in upper and "JD.COM" in upper:
+            ratio_match = re.search(r"EVERY\s+(\d+)", upper)
+            return "00700", Decimal(ratio_match.group(1)) if ratio_match else Decimal("21")
+        return None, None
+
+    def snapshot_anchor_date(self, period: str, snapshot_type: str) -> str | None:
+        period = text(period)
+        snapshot_type = text(snapshot_type).lower()
+        if re.fullmatch(r"\d{4}", period):
+            return f"{period}-01-01" if snapshot_type == "opening" else f"{period}-12-31"
+        if re.fullmatch(r"\d{6}", period):
+            year = int(period[:4])
+            month = int(period[4:6])
+            if snapshot_type == "opening":
+                return f"{year:04d}-{month:02d}-01"
+            if month == 12:
+                return f"{year:04d}-12-31"
+            next_month = datetime(year, month + 1, 1)
+            end_day = (next_month - datetime.resolution).day
+            return f"{year:04d}-{month:02d}-{end_day:02d}"
+        return None
+
+    def latest_position_quantity(self, code: str, event_date: str | None) -> Decimal | None:
+        if not event_date:
+            return None
+        normalized_code = code.zfill(5) if code.isdigit() else code.upper()
+        rows = self.conn.execute(
+            """
+            SELECT period, snapshot_type, code_name, quantity
+            FROM position_snapshots
+            WHERE quantity IS NOT NULL
+              AND (
+                code_name LIKE ?
+                OR code_name LIKE ?
+              )
+            ORDER BY period, snapshot_type
+            """,
+            (f"%{normalized_code}%", f"%{normalized_code.lstrip('0')}%"),
+        ).fetchall()
+        best_date: str | None = None
+        best_quantity: Decimal | None = None
+        for snap in rows:
+            snap_date = self.snapshot_anchor_date(snap["period"], snap["snapshot_type"])
+            if not snap_date or snap_date > event_date:
+                continue
+            if best_date is None or snap_date >= best_date:
+                best_date = snap_date
+                best_quantity = dec(snap["quantity"])
+        return best_quantity
+
+    def residual_rows_for_distribution(self, row: sqlite3.Row) -> list[sqlite3.Row]:
+        description = text(row["description_raw"]).upper()
+        if "DISTRIBUTION IN SPECIE" not in description:
+            return []
+        return self.conn.execute(
+            """
+            SELECT import_run_id, cash_entry_id, amount, source_refs, description
+            FROM cash_ledger_entries
+            WHERE import_run_id = ?
+              AND statement_id = ?
+              AND amount > 0
+              AND description LIKE '%Residual Value%'
+              AND description LIKE '%Distribution in Specie%'
+            ORDER BY event_date, cash_entry_id
+            """,
+            (row["import_run_id"], row["statement_id"]),
+        ).fetchall()
+
+    def nearest_trade_price_for_instrument(self, instrument_code: str, event_date: str | None) -> tuple[Decimal | None, str | None, str | None]:
+        if not event_date:
+            return None, None, None
+        code = instrument_code.zfill(5) if instrument_code.isdigit() else instrument_code.upper()
+        rows = self.conn.execute(
+            """
+            SELECT import_run_id, trade_id, trade_date, price, source_refs
+            FROM market_trades
+            WHERE price IS NOT NULL
+              AND (
+                instrument_symbol = ?
+                OR instrument_code_raw = ?
+                OR instrument_code_raw = ?
+              )
+            ORDER BY trade_date, trade_id
+            """,
+            (code, code, code.lstrip("0")),
+        ).fetchall()
+        best: tuple[int, sqlite3.Row] | None = None
+        event_dt = datetime.fromisoformat(event_date)
+        for trade in rows:
+            trade_date = normalize_date(trade["trade_date"])
+            if not trade_date:
+                continue
+            delta = abs((datetime.fromisoformat(trade_date) - event_dt).days)
+            if delta > 7:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, trade)
+        if best is None:
+            return None, None, None
+        trade = best[1]
+        return dec(trade["price"]), self.source_pk(trade, "trade_id"), text(trade["source_refs"]) or None
+
+    def derive_asset_movement_cost(
+        self,
+        row: sqlite3.Row,
+        inst: InstrumentInfo,
+        source_type: str,
+        quantity: Decimal,
+        event_date: str | None,
+    ) -> dict[str, Any]:
+        if source_type == "employee_equity_rsu_vest":
+            manual_cost = self.manual_rsu_vesting_cost(
+                self.source_pk(row, "asset_movement_id"),
+                text(row["description_raw"]),
+            )
+            if manual_cost is not None:
+                return manual_cost
+
+        if source_type == "corporate_action_subscription_rights_settlement" and inst.code:
+            principal_rows, fee_rows = self.cash_rows_for_subscription_rights(row, inst.code)
+            principal = q2(sum((abs(dec(cash_row["amount"])) for cash_row in principal_rows), Decimal("0")))
+            fee = q2(sum((abs(dec(cash_row["amount"])) for cash_row in fee_rows), Decimal("0")))
+            if principal or fee:
+                return {
+                    "total": q2(principal + fee),
+                    "principal": principal,
+                    "fee": fee,
+                    "status": "final",
+                    "source": "cash_paid_plus_direct_fee",
+                    "notes": f"供股/配股落股成本按现金认购款和直接手续费资本化。raw={row['description_raw']}",
+                    "components": [
+                        (
+                            "subscription_rights_cash_paid",
+                            principal,
+                            "cash_ledger_entries",
+                            ",".join(self.source_pk(cash_row, "cash_entry_id") for cash_row in principal_rows),
+                            ",".join(text(cash_row["source_refs"]) for cash_row in principal_rows if text(cash_row["source_refs"])),
+                            None,
+                            "供股/配股现金认购款。",
+                        ),
+                        (
+                            "subscription_rights_direct_fee",
+                            fee,
+                            "cash_ledger_entries",
+                            ",".join(self.source_pk(cash_row, "cash_entry_id") for cash_row in fee_rows),
+                            ",".join(text(cash_row["source_refs"]) for cash_row in fee_rows if text(cash_row["source_refs"])),
+                            None,
+                            "供股/配股相关直接手续费。",
+                        ),
+                    ],
+                }
+
+        if source_type == "corporate_action_stock_distribution":
+            parent_code, ratio = self.parent_distribution_terms(text(row["description_raw"]))
+            residual_rows = self.residual_rows_for_distribution(row)
+            residual_cash = q2(sum((dec(cash_row["amount"]) for cash_row in residual_rows), Decimal("0")))
+            parent_quantity = self.latest_position_quantity(parent_code, event_date) if parent_code and ratio else None
+            if residual_cash > 0 and parent_quantity and ratio and quantity > 0:
+                full_entitlement = parent_quantity / ratio
+                whole_shares = Decimal(int(full_entitlement))
+                fractional_share = full_entitlement - whole_shares
+                if fractional_share > 0:
+                    unit_fmv = residual_cash / fractional_share
+                    total = q2(unit_fmv * quantity)
+                    return {
+                        "total": total,
+                        "principal": total,
+                        "fee": Decimal("0"),
+                        "status": "final",
+                        "source": "fair_value_from_fractional_cash_residual",
+                        "notes": (
+                            f"实物分派按 fractional residual cash 反推分派日公允价值；"
+                            f"parent={parent_code}, ratio=1:{decimal_key(ratio)}, parent_qty={decimal_key(parent_quantity)}。"
+                        ),
+                        "components": [
+                            (
+                                "distribution_in_specie_fair_value",
+                                total,
+                                "cash_ledger_entries",
+                                ",".join(self.source_pk(cash_row, "cash_entry_id") for cash_row in residual_rows),
+                                ",".join(text(cash_row["source_refs"]) for cash_row in residual_rows if text(cash_row["source_refs"])),
+                                "residual_cash / fractional_share * whole_shares_received",
+                                "用现金残值反推同一分派事件的全股公允价值。",
+                            )
+                        ],
+                    }
+
+            if inst.code:
+                proxy_price, proxy_source_pk, proxy_source_ref = self.nearest_trade_price_for_instrument(inst.code, event_date)
+                if proxy_price is not None:
+                    total = q2(proxy_price * quantity)
+                    return {
+                        "total": total,
+                        "principal": total,
+                        "fee": Decimal("0"),
+                        "status": "provisional",
+                        "source": "nearby_trade_price_fmv_proxy",
+                        "notes": (
+                            f"实物分派缺少分派日 FMV；暂用 7 天内同标的交易价 {decimal_key(proxy_price)} "
+                            f"作为估算成本，后续应替换为分派日官方/行情收盘价。raw={row['description_raw']}"
+                        ),
+                        "components": [
+                            (
+                                "distribution_in_specie_fmv_proxy",
+                                total,
+                                "market_trades",
+                                proxy_source_pk,
+                                proxy_source_ref,
+                                "nearby_trade_price * shares_received",
+                                "估算锚点，不进入 final 税务口径。",
+                            )
+                        ],
+                        "warning": "corporate_action_fmv_proxy_lot",
+                    }
+
+        if source_type == "external_asset_transfer_in":
+            return {
+                "total": Decimal("0"),
+                "principal": Decimal("0"),
+                "fee": Decimal("0"),
+                "status": "provisional",
+                "source": "external_transfer_carryover_basis_pending",
+                "notes": f"外部转入应沿用来源账户历史成本；当前缺来源成本，按待补成本标记。raw={row['description_raw']}",
+                "components": [],
+                "warning": "external_transfer_carryover_basis_pending",
+            }
+
+        if source_type == "broker_reward_stock":
+            return {
+                "total": Decimal("0"),
+                "principal": Decimal("0"),
+                "fee": Decimal("0"),
+                "status": "provisional",
+                "source": "broker_reward_fair_value_pending",
+                "notes": f"券商赠股通常应按入账日公允价值确认成本/奖励收入；当前缺 FMV 锚点，按待补标记。raw={row['description_raw']}",
+                "components": [],
+                "warning": "broker_reward_fair_value_pending",
+            }
+
+        return {
+            "total": Decimal("0"),
+            "principal": Decimal("0"),
+            "fee": Decimal("0"),
+            "status": "provisional",
+            "source": "asset_movement_cost_unknown",
+            "notes": f"资产增加事件有数量但无金额；成本待通过公司行动规则、外部转入成本或人工补录确认。raw={row['description_raw']}",
+            "components": [],
+            "warning": "asset_movement_cost_unknown_lot",
+        }
+
+    def load_asset_movement_lots(self) -> None:
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM asset_movement_events
+            WHERE {where}
+              AND business_type = 'asset_movement'
+              AND direction_raw IN ('增加', 'In', 'IN')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+              AND description_raw NOT LIKE 'Account Upgrade%'
+              AND description_raw NOT LIKE 'IPO Allotment Qty%'
+              AND description_raw NOT LIKE 'Scrip Issued by%'
+            ORDER BY event_date, asset_movement_id
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            source_pk = self.source_pk(row, "asset_movement_id")
+            source_type, cost_source = self.classify_asset_movement_lot(text(row["description_raw"]))
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_code_raw"],
+                name_raw=row["description_raw"],
+                market="HK" if text(row["currency"]).upper() == "HKD" else None,
+                currency=row["currency"],
+            )
+            if not inst.eligible_long_equity or not inst.key:
+                self.add_validation(
+                    check_code="asset_movement_lot_unclassified",
+                    status="skipped",
+                    severity="warning",
+                    source_table="asset_movement_events",
+                    source_pk=source_pk,
+                    message=f"资产增加事件暂未生成 lot：{row['instrument_code_raw']} {row['description_raw']}",
+                    notes=inst.reason,
+                )
+                continue
+            quantity = dec(row["quantity"])
+            event_date = normalize_date(row["event_date"])
+            cost = self.derive_asset_movement_cost(row, inst, source_type, quantity, event_date)
+            raw_quantity = quantity
+            if "quantity" in cost:
+                quantity = q6(dec(cost["quantity"]))
+            lot = Lot(
+                lot_id=self.next_id("lot"),
+                account_id=self.account_id,
+                instrument_key=inst.key,
+                instrument_code=inst.code,
+                instrument_name=inst.name,
+                market=inst.market,
+                currency=text(row["currency"]).upper(),
+                source_type=source_type,
+                source_table="asset_movement_events",
+                source_pk=source_pk,
+                source_ref=row["source_ref"],
+                open_date=event_date,
+                settlement_date=None,
+                original_quantity=quantity,
+                remaining_quantity=quantity,
+                remaining_cost=cost["total"],
+                cost_basis_total=cost["total"],
+                cost_basis_principal=cost["principal"],
+                cost_basis_fee=cost["fee"],
+                cost_basis_status=cost["status"],
+                cost_basis_source=cost["source"] or cost_source,
+                notes=cost["notes"],
+            )
+            if cost["components"]:
+                for component_type, amount, source_table, component_source_pk, source_ref, formula, notes in cost["components"]:
+                    if amount:
+                        self.add_component(lot, component_type, amount, source_table, component_source_pk, source_ref, formula=formula, notes=notes)
+            else:
+                self.add_component(
+                    lot,
+                    "asset_movement_cost_placeholder",
+                    Decimal("0"),
+                    "asset_movement_events",
+                    source_pk,
+                    row["source_ref"],
+                    notes="金额缺失；仅用于数量连续性，成本仍待确认。",
+                )
+            self.add_lot(lot)
+            validation = cost.get("validation")
+            if validation:
+                self.add_validation(
+                    check_code=validation["check_code"],
+                    status="passed",
+                    severity="info",
+                    instrument_key=inst.key,
+                    source_table=validation["source_table"],
+                    source_pk=validation["source_pk"],
+                    expected_value=raw_quantity,
+                    actual_value=validation.get("actual_value"),
+                    diff_value=q6(raw_quantity - validation.get("actual_value", quantity)),
+                    message=validation["message"],
+                    notes=validation.get("notes"),
+                )
+            warning = cost.get("warning")
+            if warning:
+                self.add_validation(
+                    check_code=warning,
+                    status="skipped",
+                    severity="warning",
+                    instrument_key=inst.key,
+                    source_table="asset_movement_events",
+                    source_pk=source_pk,
+                    expected_value=cost["total"] if cost["total"] else None,
+                    actual_value=quantity,
+                    message=f"{inst.key} 已根据资产增加事件生成 {cost['status']} lot，成本口径仍需确认或补全。",
+                    notes=cost["notes"],
+                )
+
+    def load_asset_movement_removals(self) -> None:
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM asset_movement_events
+            WHERE {where}
+              AND business_type IN ('asset_movement', 'ipo_subscription')
+              AND quantity IS NOT NULL
+              AND quantity < 0
+            ORDER BY event_date, asset_movement_id
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            source_pk = self.source_pk(row, "asset_movement_id")
+            inst = infer_instrument(
+                code_raw=row["instrument_code_raw"],
+                symbol=row["instrument_code_raw"],
+                name_raw=row["description_raw"],
+                market="HK" if text(row["currency"]).upper() == "HKD" else None,
+                currency=row["currency"],
+            )
+            proceeds_policy, pnl_status_override, notes = self.classify_asset_movement_removal(row, inst)
+            if proceeds_policy == "skip":
+                self.add_validation(
+                    check_code="asset_movement_removal_skipped",
+                    status="skipped",
+                    severity="info",
+                    source_table="asset_movement_events",
+                    source_pk=source_pk,
+                    actual_value=dec(row["quantity"]),
+                    message=f"资产减少流水已按规则跳过：{row['description_raw']}",
+                    notes=notes,
+                )
+                continue
+            if not inst.eligible_long_equity or not inst.key:
+                self.add_validation(
+                    check_code="asset_movement_removal_unclassified",
+                    status="skipped",
+                    severity="warning",
+                    source_table="asset_movement_events",
+                    source_pk=source_pk,
+                    message=f"资产减少事件暂未进入 allocation：{row['instrument_code_raw']} {row['description_raw']}",
+                    notes=inst.reason,
+                )
+                continue
+
+            description_upper = text(row["description_raw"]).upper()
+            proceeds = Decimal("0")
+            if proceeds_policy == "provided" and (
+                inst.inferred_type == "hk_structured_product"
+                or "HOLDING_REMOVAL" in description_upper
+                or "PAYMENT FOLLOWING MCE" in description_upper
+            ):
+                proceeds = self.asset_movement_removal_cash_proceeds(row, inst)
+
+            self.close_events.append(
+                CloseEvent(
+                    event_id=source_pk,
+                    event_table="asset_movement_events",
+                    event_date=normalize_date(row["event_date"]),
+                    settlement_date=None,
+                    source_ref=row["source_ref"],
+                    instrument_key=inst.key,
+                    instrument_code=inst.code,
+                    instrument_name=inst.name,
+                    currency=text(row["currency"]).upper(),
+                    quantity=abs(dec(row["quantity"])),
+                    proceeds=proceeds,
+                    notes=f"{notes} raw={row['description_raw']}",
+                    proceeds_policy=proceeds_policy,
+                    pnl_status_override=pnl_status_override,
+                )
+            )
 
     def normalized_trade_dates(self, row: sqlite3.Row) -> tuple[str | None, str | None, str | None]:
         dates = extract_dates(row["trade_date"], row["settlement_date"], row["instrument_code_raw"], row["instrument_symbol"])
@@ -767,14 +1864,15 @@ class LotAllocator:
         return trade_date, settlement_date, note
 
     def load_market_trade_lots_and_closes(self) -> None:
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM market_trades
-            WHERE import_run_id = ?
+            WHERE {where}
             ORDER BY period, COALESCE(trade_date, ''), trade_id
             """,
-            (self.import_run_id,),
+            params,
         ).fetchall()
         for row in rows:
             inst = infer_instrument(
@@ -785,7 +1883,7 @@ class LotAllocator:
                 currency=row["currency"],
                 instrument_type=row["instrument_type"],
             )
-            source_pk = row["trade_id"]
+            source_pk = self.source_pk(row, "trade_id")
             side = text(row["side"]).lower()
             position_effect = text(row["position_effect"]).lower()
             trade_date, settlement_date, note = self.normalized_trade_dates(row)
@@ -925,16 +2023,18 @@ class LotAllocator:
                 )
 
     def load_option_lots_and_closes(self) -> None:
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM market_trades
-            WHERE import_run_id = ?
+            WHERE {where}
             ORDER BY period, COALESCE(trade_date, ''), trade_id
             """,
-            (self.import_run_id,),
+            params,
         ).fetchall()
         for row in rows:
+            source_pk = self.source_pk(row, "trade_id")
             contract = parse_option_contract(
                 code_raw=row["instrument_code_raw"],
                 symbol=row["instrument_symbol"],
@@ -967,7 +2067,7 @@ class LotAllocator:
                         position_side="short",
                         source_type="option_sell_open",
                         source_table="market_trades",
-                        source_pk=row["trade_id"],
+                        source_pk=source_pk,
                         source_ref=row["source_refs"],
                         open_date=trade_date,
                         settlement_date=settlement_date,
@@ -990,7 +2090,7 @@ class LotAllocator:
                         position_side="long",
                         source_type="option_buy_open",
                         source_table="market_trades",
-                        source_pk=row["trade_id"],
+                        source_pk=source_pk,
                         source_ref=row["source_refs"],
                         open_date=trade_date,
                         settlement_date=settlement_date,
@@ -1007,7 +2107,7 @@ class LotAllocator:
             elif side == "buy" and position_effect == "close":
                 self.option_close_events.append(
                     OptionCloseEvent(
-                        event_id=row["trade_id"],
+                        event_id=source_pk,
                         event_table="market_trades",
                         event_date=trade_date,
                         settlement_date=settlement_date,
@@ -1024,7 +2124,7 @@ class LotAllocator:
             elif side == "sell" and position_effect == "close":
                 self.option_close_events.append(
                     OptionCloseEvent(
-                        event_id=row["trade_id"],
+                        event_id=source_pk,
                         event_table="market_trades",
                         event_date=trade_date,
                         settlement_date=settlement_date,
@@ -1045,24 +2145,26 @@ class LotAllocator:
                     severity="error",
                     instrument_key=contract.contract_key,
                     source_table="market_trades",
-                    source_pk=row["trade_id"],
+                    source_pk=source_pk,
                     message=f"期权交易方向暂无法处理：{contract.code} {side}/{position_effect}",
                 )
 
     def load_option_exercise_events(self) -> None:
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM asset_movement_events
-            WHERE import_run_id = ?
+            WHERE {where}
               AND asset_movement_type = 'option_expiry_close'
               AND quantity IS NOT NULL
               AND quantity > 0
             ORDER BY event_date, asset_movement_id
             """,
-            (self.import_run_id,),
+            params,
         ).fetchall()
         for row in rows:
+            source_pk = self.source_pk(row, "asset_movement_id")
             contract = parse_option_contract(
                 code_raw=row["instrument_code_raw"],
                 symbol=row["instrument_code_raw"],
@@ -1076,7 +2178,7 @@ class LotAllocator:
                     status="failed",
                     severity="error",
                     source_table="asset_movement_events",
-                    source_pk=row["asset_movement_id"],
+                    source_pk=source_pk,
                     message=f"期权到期/行权事件无法识别合约：{row['description_raw']}",
                 )
                 continue
@@ -1089,7 +2191,7 @@ class LotAllocator:
                 outcome = "exercise_or_assignment_unknown"
             self.option_close_events.append(
                 OptionCloseEvent(
-                    event_id=row["asset_movement_id"],
+                    event_id=source_pk,
                     event_table="asset_movement_events",
                     event_date=normalize_date(row["event_date"]),
                     settlement_date=None,
@@ -1131,18 +2233,19 @@ class LotAllocator:
             expected_side = "buy" if lot.position_side == "short" else "sell"
         expected_effect = "close" if expected_side == "sell" else "open"
 
+        where, params = self.fact_where_clause()
         candidate_rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM market_trades
-            WHERE import_run_id = ?
+            WHERE {where}
               AND REPLACE(trade_date, '/', '-') = ?
               AND side = ?
               AND position_effect = ?
               AND currency = ?
             ORDER BY trade_id
             """,
-            (self.import_run_id, event.event_date, expected_side, expected_effect, event.contract.currency),
+            (*params, event.event_date, expected_side, expected_effect, event.contract.currency),
         ).fetchall()
         matched: sqlite3.Row | None = None
         matched_inst: Instrument | None = None
@@ -1185,13 +2288,13 @@ class LotAllocator:
                 "option_contract_key": event.contract.contract_key,
                 "link_type": "assignment_underlying_delivery",
                 "underlying_event_table": "market_trades",
-                "underlying_event_id": matched["trade_id"],
+                "underlying_event_id": self.source_pk(matched, "trade_id"),
                 "underlying_instrument_key": matched_inst.key,
                 "underlying_quantity": expected_quantity,
                 "strike_price": event.contract.strike_price,
                 "underlying_gross_amount": q2(abs(dec(matched["gross_amount"]))),
                 "confidence": "inferred_same_date_qty_strike",
-                "notes": f"{event.contract.code} -> {matched_inst.key} {matched['trade_id']}",
+                "notes": f"{event.contract.code} -> {matched_inst.key} {self.source_pk(matched, 'trade_id')}",
             }
         )
         self.add_validation(
@@ -1308,22 +2411,20 @@ class LotAllocator:
                 )
 
     def validate_option_remaining_positions(self) -> None:
-        latest_period = self.conn.execute(
-            "SELECT MAX(period) FROM raw_statements WHERE import_run_id = ?",
-            (self.import_run_id,),
-        ).fetchone()[0]
+        latest_period = self.latest_period()
         expected: dict[str, Decimal] = {}
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM position_snapshots
-            WHERE import_run_id = ?
+            WHERE {where}
               AND period = ?
               AND snapshot_type = 'ending'
-              AND asset_category = 'stock_or_option'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
               AND quantity IS NOT NULL
             """,
-            (self.import_run_id, latest_period),
+            (*params, latest_period),
         ).fetchall()
         for row in rows:
             contract = parse_option_contract(
@@ -1382,15 +2483,13 @@ class LotAllocator:
             )
 
     def load_fund_lots_and_redemptions(self) -> None:
-        first_period = self.conn.execute(
-            "SELECT MIN(period) FROM raw_statements WHERE import_run_id = ?",
-            (self.import_run_id,),
-        ).fetchone()[0]
+        first_period = self.first_period()
+        where, params = self.fact_where_clause()
         opening_rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM position_snapshots
-            WHERE import_run_id = ?
+            WHERE {where}
               AND period = ?
               AND snapshot_type = 'opening'
               AND asset_category = 'fund'
@@ -1398,7 +2497,7 @@ class LotAllocator:
               AND quantity > 0
             ORDER BY code_name, page, table_index, row_index
             """,
-            (self.import_run_id, first_period),
+            (*params, first_period),
         ).fetchall()
         for row in opening_rows:
             fund = infer_fund_instrument(code_raw=row["code_name"], currency=row["currency"])
@@ -1436,15 +2535,16 @@ class LotAllocator:
             self.fund_lots.append(lot)
 
         order_rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM fund_orders
-            WHERE import_run_id = ?
+            WHERE {where}
             ORDER BY period, COALESCE(trade_date, order_date, ''), fund_order_id
             """,
-            (self.import_run_id,),
+            params,
         ).fetchall()
         for row in order_rows:
+            source_pk = self.source_pk(row, "fund_order_id")
             fund = infer_fund_instrument(
                 code_raw=row["instrument_code"],
                 name_raw=row["instrument_name_raw"],
@@ -1456,7 +2556,7 @@ class LotAllocator:
                     status="failed",
                     severity="error",
                     source_table="fund_orders",
-                    source_pk=row["fund_order_id"],
+                    source_pk=source_pk,
                     message=f"基金订单无法识别代码：{row['instrument_code']} {row['instrument_name_raw']}",
                 )
                 continue
@@ -1472,7 +2572,7 @@ class LotAllocator:
                     severity="info",
                     instrument_key=fund.key,
                     source_table="fund_orders",
-                    source_pk=row["fund_order_id"],
+                    source_pk=source_pk,
                     expected_value=amount,
                     actual_value=Decimal("0"),
                     message=f"{row['fund_order_id']} 只有金额、缺少份额，保留为原始事实但不生成 fund lot/allocation。",
@@ -1488,7 +2588,7 @@ class LotAllocator:
                         fund=fund,
                         source_type="fund_subscription",
                         source_table="fund_orders",
-                        source_pk=row["fund_order_id"],
+                        source_pk=source_pk,
                         source_ref=row["source_refs"],
                         open_date=trade_date,
                         original_units=units,
@@ -1504,7 +2604,7 @@ class LotAllocator:
             elif order_type == "redemption":
                 self.fund_redemption_events.append(
                     FundRedemptionEvent(
-                        order_id=row["fund_order_id"],
+                        order_id=source_pk,
                         redemption_date=trade_date,
                         source_ref=row["source_refs"],
                         fund=fund,
@@ -1521,7 +2621,7 @@ class LotAllocator:
                     severity="error",
                     instrument_key=fund.key,
                     source_table="fund_orders",
-                    source_pk=row["fund_order_id"],
+                    source_pk=source_pk,
                     message=f"{row['fund_order_id']} 基金订单类型暂无法处理：{row['fund_order_type']}",
                 )
 
@@ -1596,36 +2696,77 @@ class LotAllocator:
                     message=f"{event.order_id} 基金赎回份额已完整 FIFO 分配。",
                 )
             else:
+                synthetic_cost = q2(remaining_proceeds)
+                synthetic_lot = FundLot(
+                    fund_lot_id=self.next_id("fund_lot"),
+                    account_id=self.account_id,
+                    fund=event.fund,
+                    source_type="synthetic_missing_fund_opening_position",
+                    source_table="fund_orders",
+                    source_pk=event.order_id,
+                    source_ref=event.source_ref,
+                    open_date=event.redemption_date,
+                    original_units=remaining_units,
+                    remaining_units=remaining_units,
+                    cost_basis_total=synthetic_cost,
+                    remaining_cost=synthetic_cost,
+                    cost_basis_status="provisional",
+                    cost_basis_source="missing_pre_scope_fund_lot_zero_pnl_placeholder",
+                    cash_source_status=event.cash_match_status,
+                    notes="范围开始前缺少基金申购 / 期初份额成本；临时按本次赎回 proceeds 生成占位 lot，使该段 realized PnL 为 0。",
+                )
+                self.fund_lots.append(synthetic_lot)
+                lots_by_key.setdefault(event.fund.key, []).append(synthetic_lot)
+                self.fund_allocations.append(
+                    {
+                        "fund_allocation_id": self.next_id("fund_allocation"),
+                        "fund_lot_id": synthetic_lot.fund_lot_id,
+                        "redemption_order_id": event.order_id,
+                        "redemption_date": event.redemption_date,
+                        "redemption_source_ref": event.source_ref,
+                        "fund_key": event.fund.key,
+                        "fund_code": event.fund.code,
+                        "fund_name": event.fund.name,
+                        "currency": event.fund.currency,
+                        "units_allocated": remaining_units,
+                        "proceeds_allocated": remaining_proceeds,
+                        "cost_allocated": synthetic_cost,
+                        "realized_pnl": q2(remaining_proceeds - synthetic_cost),
+                        "cost_basis_status": synthetic_lot.cost_basis_status,
+                        "pnl_status": "provisional",
+                        "notes": "synthetic missing fund opening lot; true historical cost pending",
+                    }
+                )
+                synthetic_lot.remaining_units = Decimal("0")
+                synthetic_lot.remaining_cost = Decimal("0")
                 self.add_validation(
-                    check_code="fund_insufficient_lot",
-                    status="failed",
-                    severity="error",
+                    check_code="synthetic_missing_fund_opening_lot",
+                    status="skipped",
+                    severity="warning",
                     instrument_key=event.fund.key,
                     source_table="fund_orders",
                     source_pk=event.order_id,
                     expected_value=event.units,
                     actual_value=q6(event.units - remaining_units),
                     diff_value=remaining_units,
-                    message=f"{event.order_id} 可用基金 lot 不足，剩余未分配份额 {remaining_units}。",
+                    message=f"{event.order_id} 缺少范围开始前基金 lot，已生成临时 opening fund lot；该笔收益为 provisional。",
                 )
 
     def expected_latest_fund_units(self) -> tuple[str, dict[str, Decimal]]:
-        latest_period = self.conn.execute(
-            "SELECT MAX(period) FROM raw_statements WHERE import_run_id = ?",
-            (self.import_run_id,),
-        ).fetchone()[0]
+        latest_period = self.latest_period()
         expected: dict[str, Decimal] = {}
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM position_snapshots
-            WHERE import_run_id = ?
+            WHERE {where}
               AND period = ?
               AND snapshot_type = 'ending'
               AND asset_category = 'fund'
               AND quantity IS NOT NULL
             """,
-            (self.import_run_id, latest_period),
+            (*params, latest_period),
         ).fetchall()
         for row in rows:
             fund = infer_fund_instrument(code_raw=row["code_name"], currency=row["currency"])
@@ -1691,6 +2832,18 @@ class LotAllocator:
                     message=f"{lot.fund_lot_id} 已标记为待结算基金申购，不参与 {latest_period} 期末持仓校验。",
                 )
             if remaining_excess > Q6:
+                if remaining_excess <= FUND_DUST_UNITS_TOLERANCE:
+                    self.add_validation(
+                        check_code="fund_rounding_dust_units_carried",
+                        status="skipped",
+                        severity="warning",
+                        instrument_key=fund_key,
+                        expected_value=excess,
+                        actual_value=q6(excess - remaining_excess),
+                        diff_value=remaining_excess,
+                        message=f"{fund_key} 剩余 {remaining_excess} 份基金尾差低于 dust 容忍阈值，保留为 rounding dust。",
+                    )
+                    continue
                 self.add_validation(
                     check_code="fund_pending_settlement_unresolved",
                     status="failed",
@@ -1713,8 +2866,18 @@ class LotAllocator:
             expected_units = q6(expected.get(key, Decimal("0")))
             actual_units = q6(actual.get(key, Decimal("0")))
             diff = q6(actual_units - expected_units)
-            status = "passed" if abs(diff) <= Q6 else "failed"
-            severity = "info" if status == "passed" else "error"
+            if abs(diff) <= Q6:
+                status = "passed"
+                severity = "info"
+                notes = None
+            elif abs(diff) <= FUND_DUST_UNITS_TOLERANCE:
+                status = "skipped"
+                severity = "warning"
+                notes = "fund rounding dust tolerated; no cash impact materiality inferred from raw amount"
+            else:
+                status = "failed"
+                severity = "error"
+                notes = None
             self.add_validation(
                 check_code="fund_ending_position_units_match",
                 status=status,
@@ -1726,6 +2889,7 @@ class LotAllocator:
                 actual_value=actual_units,
                 diff_value=diff,
                 message=f"{key} fund lot 剩余份额与 {latest_period} 期末基金持仓{'一致' if status == 'passed' else '不一致'}。",
+                notes=notes,
             )
 
         negative_lots = [lot for lot in self.fund_lots if lot.remaining_units < 0]
@@ -1900,14 +3064,16 @@ class LotAllocator:
                 take_qty = min(lot.remaining_quantity, remaining_qty)
                 is_last_piece_for_event = take_qty == remaining_qty
                 is_closing_lot = take_qty == lot.remaining_quantity
-                if is_last_piece_for_event:
-                    proceeds_allocated = q2(remaining_proceeds)
-                else:
-                    proceeds_allocated = q2(event.proceeds * take_qty / event.quantity)
                 if is_closing_lot:
                     cost_allocated = q2(lot.remaining_cost)
                 else:
                     cost_allocated = q2(lot.unit_cost * take_qty)
+                if event.proceeds_policy == "cost_basis_transfer":
+                    proceeds_allocated = cost_allocated
+                elif is_last_piece_for_event:
+                    proceeds_allocated = q2(remaining_proceeds)
+                else:
+                    proceeds_allocated = q2(event.proceeds * take_qty / event.quantity)
                 realized_pnl = q2(proceeds_allocated - cost_allocated)
                 allocation_id = self.next_id("allocation")
                 self.allocations.append(
@@ -1928,14 +3094,15 @@ class LotAllocator:
                         "cost_allocated": cost_allocated,
                         "realized_pnl": realized_pnl,
                         "cost_basis_status": lot.cost_basis_status,
-                        "pnl_status": "provisional" if lot.cost_basis_status != "final" else "final",
+                        "pnl_status": event.pnl_status_override or ("provisional" if lot.cost_basis_status != "final" else "final"),
                         "notes": event.notes,
                     }
                 )
                 lot.remaining_quantity = q6(lot.remaining_quantity - take_qty)
                 lot.remaining_cost = q2(lot.remaining_cost - cost_allocated)
                 remaining_qty = q6(remaining_qty - take_qty)
-                remaining_proceeds = q2(remaining_proceeds - proceeds_allocated)
+                if event.proceeds_policy != "cost_basis_transfer":
+                    remaining_proceeds = q2(remaining_proceeds - proceeds_allocated)
 
             if abs(remaining_qty) <= Q6:
                 self.add_validation(
@@ -1951,37 +3118,312 @@ class LotAllocator:
                     message=f"{event.event_id} 卖出数量已完整 FIFO 分配。",
                 )
             else:
+                synthetic_cost = Decimal("0") if event.proceeds_policy == "cost_basis_transfer" else q2(remaining_proceeds)
+                synthetic_proceeds = synthetic_cost if event.proceeds_policy == "cost_basis_transfer" else remaining_proceeds
+                synthetic_lot = Lot(
+                    lot_id=self.next_id("lot"),
+                    account_id=self.account_id,
+                    instrument_key=event.instrument_key,
+                    instrument_code=event.instrument_code,
+                    instrument_name=event.instrument_name,
+                    market=None,
+                    currency=event.currency,
+                    source_type="synthetic_missing_opening_position",
+                    source_table=event.event_table,
+                    source_pk=event.event_id,
+                    source_ref=event.source_ref,
+                    open_date=event.event_date,
+                    settlement_date=event.settlement_date,
+                    original_quantity=remaining_qty,
+                    remaining_quantity=remaining_qty,
+                    remaining_cost=synthetic_cost,
+                    cost_basis_total=synthetic_cost,
+                    cost_basis_principal=synthetic_cost,
+                    cost_basis_fee=Decimal("0"),
+                    cost_basis_status="provisional",
+                    cost_basis_source="missing_pre_scope_open_lot_zero_pnl_placeholder",
+                    notes="范围开始前缺少买入 / 持仓成本；临时按本次卖出 proceeds 生成占位 lot，使该段 realized PnL 为 0，等待更早结单或人工成本补录。",
+                )
+                self.add_lot(synthetic_lot)
+                lots_by_key.setdefault(event.instrument_key, []).append(synthetic_lot)
+                allocation_id = self.next_id("allocation")
+                self.allocations.append(
+                    {
+                        "allocation_id": allocation_id,
+                        "close_event_table": event.event_table,
+                        "close_event_id": event.event_id,
+                        "close_event_date": event.event_date,
+                        "close_settlement_date": event.settlement_date,
+                        "close_source_ref": event.source_ref,
+                        "instrument_key": event.instrument_key,
+                        "instrument_code": event.instrument_code,
+                        "instrument_name": event.instrument_name,
+                        "currency": event.currency,
+                        "lot_id": synthetic_lot.lot_id,
+                        "quantity_allocated": remaining_qty,
+                        "proceeds_allocated": synthetic_proceeds,
+                        "cost_allocated": synthetic_cost,
+                        "realized_pnl": q2(synthetic_proceeds - synthetic_cost),
+                        "cost_basis_status": synthetic_lot.cost_basis_status,
+                        "pnl_status": event.pnl_status_override or "provisional",
+                        "notes": f"synthetic missing opening lot; true historical cost pending; {event.notes or ''}".strip("; "),
+                    }
+                )
+                synthetic_lot.remaining_quantity = Decimal("0")
+                synthetic_lot.remaining_cost = Decimal("0")
                 self.add_validation(
-                    check_code="insufficient_lot",
-                    status="failed",
-                    severity="error",
+                    check_code="synthetic_missing_opening_lot",
+                    status="skipped",
+                    severity="warning",
                     instrument_key=event.instrument_key,
                     source_table=event.event_table,
                     source_pk=event.event_id,
                     expected_value=event.quantity,
                     actual_value=q6(event.quantity - remaining_qty),
                     diff_value=remaining_qty,
-                    message=f"{event.event_id} 可用 lot 不足，剩余未分配数量 {remaining_qty}。",
+                    message=f"{event.event_id} 缺少范围开始前 lot，已生成临时 opening lot；该笔收益为 provisional。",
                 )
 
-    def validate_remaining_positions(self) -> None:
-        latest_period = self.conn.execute(
-            "SELECT MAX(period) FROM raw_statements WHERE import_run_id = ?",
-            (self.import_run_id,),
-        ).fetchone()[0]
-        expected: dict[str, Decimal] = {}
-        expected_names: dict[str, tuple[str | None, str | None, str | None]] = {}
+    def latest_expected_long_position_keys(self) -> set[str]:
+        latest_period = self.latest_period()
+        where, params = self.fact_where_clause()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM position_snapshots
-            WHERE import_run_id = ?
+            WHERE {where}
               AND period = ?
               AND snapshot_type = 'ending'
-              AND asset_category = 'stock_or_option'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND quantity > 0
+            """,
+            (*params, latest_period),
+        ).fetchall()
+        keys: set[str] = set()
+        for row in rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if inst.eligible_long_equity and inst.key:
+                keys.add(inst.key)
+        return keys
+
+    def structured_product_disappearance_date(self, lot: Lot) -> tuple[str | None, str]:
+        if not lot.instrument_code:
+            return None, "structured product lot has no instrument code"
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT period, snapshot_type, code_name, market, currency, asset_category, quantity
+            FROM position_snapshots
+            WHERE {where}
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+              AND code_name LIKE ?
+            ORDER BY period, snapshot_type
+            """,
+            (*params, f"%{lot.instrument_code}%"),
+        ).fetchall()
+        by_period: dict[str, dict[str, Decimal]] = {}
+        last_positive_period: str | None = None
+        for row in rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if inst.key != lot.instrument_key or inst.inferred_type != "hk_structured_product":
+                continue
+            snapshot_type = text(row["snapshot_type"]).lower()
+            if snapshot_type in {"ending", "closing"}:
+                bucket = "ending"
+            elif snapshot_type == "opening":
+                bucket = "opening"
+            else:
+                continue
+            anchor_date = self.snapshot_anchor_date(text(row["period"]), bucket)
+            if lot.open_date and anchor_date and anchor_date < lot.open_date:
+                continue
+            quantity = dec(row["quantity"])
+            if quantity <= 0:
+                continue
+            period = text(row["period"])
+            by_period.setdefault(period, {})
+            by_period[period][bucket] = by_period[period].get(bucket, Decimal("0")) + quantity
+            last_positive_period = period
+
+        for period in sorted(by_period):
+            opening_qty = by_period[period].get("opening")
+            ending_qty = by_period[period].get("ending")
+            if opening_qty and opening_qty > 0 and (ending_qty is None or ending_qty <= 0):
+                return self.snapshot_anchor_date(period, "ending"), "opening_position_disappeared_before_period_end"
+
+        if last_positive_period and last_positive_period < self.latest_period():
+            return self.snapshot_anchor_date(last_positive_period, "ending"), "last_positive_statement_position_not_seen_later"
+        return None, "no statement disappearance evidence"
+
+    def expire_structured_product_residual_lots(self) -> None:
+        latest_open_keys = self.latest_expected_long_position_keys()
+        for lot in list(self.lots):
+            if lot.remaining_quantity <= 0:
+                continue
+            if lot.instrument_key in latest_open_keys:
+                continue
+            if not looks_like_hk_structured_product(lot.instrument_name, lot.source_ref, lot.source_pk):
+                continue
+            expiry_date, evidence = self.structured_product_disappearance_date(lot)
+            if not expiry_date:
+                self.add_validation(
+                    check_code="structured_product_expiry_unresolved",
+                    status="skipped",
+                    severity="warning",
+                    instrument_key=lot.instrument_key,
+                    source_table=lot.source_table,
+                    source_pk=lot.source_pk,
+                    actual_value=lot.remaining_quantity,
+                    message=f"{lot.instrument_key} 疑似港股权证/牛熊证仍有剩余 lot，但缺少可定位的消失月份。",
+                    notes=evidence,
+                )
+                continue
+
+            quantity = lot.remaining_quantity
+            cost_allocated = q2(lot.remaining_cost)
+            allocation_id = self.next_id("allocation")
+            self.allocations.append(
+                {
+                    "allocation_id": allocation_id,
+                    "close_event_table": "synthetic_structured_product_expiry",
+                    "close_event_id": f"{lot.lot_id}:{expiry_date}",
+                    "close_event_date": expiry_date,
+                    "close_settlement_date": None,
+                    "close_source_ref": lot.source_ref,
+                    "instrument_key": lot.instrument_key,
+                    "instrument_code": lot.instrument_code,
+                    "instrument_name": lot.instrument_name,
+                    "currency": lot.currency,
+                    "lot_id": lot.lot_id,
+                    "quantity_allocated": quantity,
+                    "proceeds_allocated": Decimal("0"),
+                    "cost_allocated": cost_allocated,
+                    "realized_pnl": -cost_allocated,
+                    "cost_basis_status": lot.cost_basis_status,
+                    "pnl_status": "provisional" if lot.cost_basis_status != "final" else "final",
+                    "notes": f"港股权证/牛熊证在后续结单不再出现，按 {expiry_date} 到期/失效归零处理；evidence={evidence}。",
+                }
+            )
+            lot.remaining_quantity = Decimal("0")
+            lot.remaining_cost = Decimal("0")
+            self.add_validation(
+                check_code="structured_product_expiry_inferred",
+                status="skipped",
+                severity="warning",
+                instrument_key=lot.instrument_key,
+                source_table=lot.source_table,
+                source_pk=lot.source_pk,
+                expected_value=quantity,
+                actual_value=Decimal("0"),
+                diff_value=-quantity,
+                message=f"{lot.instrument_key} 剩余权证/牛熊证 lot 已按结单消失月份归零。",
+                notes=evidence,
+            )
+
+    def add_latest_position_deficit_lots(self) -> None:
+        latest_period = self.latest_period()
+        expected: dict[str, Decimal] = {}
+        expected_names: dict[str, tuple[str | None, str | None, str | None, str | None]] = {}
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM position_snapshots
+            WHERE {where}
+              AND period = ?
+              AND snapshot_type = 'ending'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
               AND quantity IS NOT NULL
             """,
-            (self.import_run_id, latest_period),
+            (*params, latest_period),
+        ).fetchall()
+        for row in rows:
+            inst = infer_instrument(
+                code_raw=row["code_name"],
+                market=row["market"],
+                currency=row["currency"],
+                instrument_type=row["asset_category"],
+            )
+            if not inst.eligible_long_equity or not inst.key:
+                continue
+            expected[inst.key] = expected.get(inst.key, Decimal("0")) + dec(row["quantity"])
+            expected_names[inst.key] = (inst.code, inst.name, inst.market, text(row["currency"]).upper())
+
+        actual: dict[str, Decimal] = {}
+        for lot in self.lots:
+            actual[lot.instrument_key] = actual.get(lot.instrument_key, Decimal("0")) + lot.remaining_quantity
+
+        for key, expected_qty in sorted(expected.items()):
+            deficit = q6(expected_qty - actual.get(key, Decimal("0")))
+            if deficit <= Q6:
+                continue
+            code, name, market, currency = expected_names[key]
+            lot = Lot(
+                lot_id=self.next_id("lot"),
+                account_id=self.account_id,
+                instrument_key=key,
+                instrument_code=code,
+                instrument_name=name,
+                market=market,
+                currency=currency or "HKD",
+                source_type="synthetic_missing_position",
+                source_table="position_snapshots",
+                source_pk=f"{latest_period}:{key}",
+                source_ref=None,
+                open_date=period_start_date(latest_period),
+                settlement_date=None,
+                original_quantity=deficit,
+                remaining_quantity=deficit,
+                remaining_cost=Decimal("0"),
+                cost_basis_total=Decimal("0"),
+                cost_basis_principal=Decimal("0"),
+                cost_basis_fee=Decimal("0"),
+                cost_basis_status="provisional",
+                cost_basis_source="latest_position_deficit_placeholder",
+                notes="最新期末持仓多于可追溯 lot；通常来自账户升级/资产转入/拆股等历史成本缺口，需后续用更早结单或人工成本补录。",
+            )
+            self.add_lot(lot)
+            self.add_validation(
+                check_code="synthetic_missing_ending_position_lot",
+                status="skipped",
+                severity="warning",
+                instrument_key=key,
+                source_table="position_snapshots",
+                source_pk=f"{latest_period}:{key}",
+                expected_value=expected_qty,
+                actual_value=q6(actual.get(key, Decimal("0"))),
+                diff_value=deficit,
+                message=f"{key} 最新期末持仓缺少可追溯 lot，已生成 provisional 持仓占位。",
+            )
+
+    def validate_remaining_positions(self) -> None:
+        latest_period = self.latest_period()
+        expected: dict[str, Decimal] = {}
+        expected_names: dict[str, tuple[str | None, str | None, str | None]] = {}
+        where, params = self.fact_where_clause()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM position_snapshots
+            WHERE {where}
+              AND period = ?
+              AND snapshot_type = 'ending'
+              AND asset_category IN ('stock_or_option', 'stock_or_derivative')
+              AND quantity IS NOT NULL
+            """,
+            (*params, latest_period),
         ).fetchall()
         for row in rows:
             inst = infer_instrument(
@@ -2471,6 +3913,46 @@ def latest_import_run_id(conn: sqlite3.Connection) -> str:
     return row[0]
 
 
+def all_import_run_ids(conn: sqlite3.Connection) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT import_run_id FROM import_runs ORDER BY created_at, import_run_id",
+        ).fetchall()
+    ]
+
+
+def selected_import_run_ids(conn: sqlite3.Connection, args: argparse.Namespace) -> list[str]:
+    if getattr(args, "all_import_runs", False):
+        run_ids = all_import_run_ids(conn)
+    elif args.import_run_ids:
+        run_ids = list(args.import_run_ids)
+    else:
+        run_ids = [latest_import_run_id(conn)]
+    if not run_ids:
+        raise RuntimeError("No import_runs found in database.")
+    return run_ids
+
+
+def statement_ids_for_account(conn: sqlite3.Connection, import_run_ids: list[str], account_id: str) -> list[str]:
+    if not table_exists(conn, "statement_accounts"):
+        return []
+    placeholders = ", ".join("?" for _ in import_run_ids)
+    return [
+        row[0]
+        for row in conn.execute(
+            f"""
+            SELECT statement_id
+            FROM statement_accounts
+            WHERE import_run_id IN ({placeholders})
+              AND account_id = ?
+            ORDER BY statement_id
+            """,
+            (*import_run_ids, account_id),
+        ).fetchall()
+    ]
+
+
 def delete_existing_run(conn: sqlite3.Connection, allocation_run_id: str) -> None:
     for table in (
         "lot_allocation_validation_items",
@@ -2499,7 +3981,11 @@ def run_allocation(args: argparse.Namespace) -> dict[str, Any]:
 
     with connect(db_path) as conn:
         apply_schema(conn, schema_path)
-        import_run_id = args.import_run_id or latest_import_run_id(conn)
+        import_run_ids = selected_import_run_ids(conn, args)
+        import_run_id = ",".join(import_run_ids)
+        statement_ids = list(args.statement_ids or [])
+        if not statement_ids:
+            statement_ids = statement_ids_for_account(conn, import_run_ids, args.account_id)
         if args.replace:
             delete_existing_run(conn, allocation_run_id)
         conn.execute(
@@ -2509,20 +3995,32 @@ def run_allocation(args: argparse.Namespace) -> dict[str, Any]:
             )
             VALUES (?, ?, ?, 'fifo', 'stock_ipo_option_fund_short_v1', 'running', ?)
             """,
-            (allocation_run_id, import_run_id, args.account_id, "正股 / ETF long position + IPO 中签配发 + 期权合约 + 基金申赎 + 股票短仓 FIFO allocation v1。"),
+            (
+                allocation_run_id,
+                import_run_id,
+                args.account_id,
+                "正股 / ETF long position + IPO 中签配发 + 期权合约 + 基金申赎 + 股票短仓 FIFO allocation v1。"
+                + (f" statement_scope={len(statement_ids)}" if statement_ids else " statement_scope=all"),
+            ),
         )
-        allocator = LotAllocator(conn, allocation_run_id, import_run_id, args.account_id)
+        allocator = LotAllocator(conn, allocation_run_id, import_run_ids, args.account_id, statement_ids=statement_ids)
         allocator.load_opening_lots()
+        allocator.load_account_inception_lots_from_first_ending()
+        allocator.load_first_observed_opening_lots()
         allocator.load_ipo_allotment_lots()
+        allocator.load_asset_movement_lots()
         allocator.load_fund_lots_and_redemptions()
         allocator.load_market_trade_lots_and_closes()
+        allocator.load_asset_movement_removals()
         allocator.load_option_lots_and_closes()
         allocator.load_option_exercise_events()
         allocator.allocate_fifo()
+        allocator.expire_structured_product_residual_lots()
         allocator.allocate_options_fifo()
         allocator.allocate_funds_fifo()
         allocator.allocate_short_stock_fifo()
         allocator.mark_fund_pending_settlement_lots()
+        allocator.add_latest_position_deficit_lots()
         allocator.validate_remaining_positions()
         allocator.validate_option_remaining_positions()
         allocator.validate_fund_remaining_positions()
@@ -3107,8 +4605,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT)
     run_parser.add_argument("--export-dir", type=Path, default=DEFAULT_EXPORT_DIR)
     run_parser.add_argument("--run-id", default=None)
-    run_parser.add_argument("--import-run-id", default=None)
+    run_parser.add_argument("--import-run-id", dest="import_run_ids", action="append", default=None)
+    run_parser.add_argument("--all-import-runs", action="store_true")
     run_parser.add_argument("--account-id", default="futu_hk_main")
+    run_parser.add_argument("--statement-id", dest="statement_ids", action="append", default=None)
     run_parser.add_argument("--replace", action="store_true")
     run_parser.set_defaults(func=run_allocation)
 

@@ -11,8 +11,10 @@
 *.raw.json
 
 # Generated/private folders
+data/
 cache/
 exports/
+reports/
 work/
 tmp/
 staging/
@@ -30,4 +32,5 @@ __pycache__/
 node_modules/
 .env
 .env.*
+!.env.example
 config/*.local.json
