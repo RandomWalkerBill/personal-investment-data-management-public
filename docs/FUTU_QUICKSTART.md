@@ -150,6 +150,10 @@ reports/ipo/ipo-report.md
 reports/ipo/ipo_cash_legs.csv
 reports/ipo/ipo_asset_events.csv
 reports/ipo/ipo_lots.csv
+reports/ipo/ipo_sale_allocations.csv
+reports/ipo/ipo_financing_interest_summary.csv
+reports/ipo/ipo_financing_interest_details.csv
+reports/ipo/ipo_strategy_summary.csv
 reports/ipo/ipo_review_items.csv
 ```
 

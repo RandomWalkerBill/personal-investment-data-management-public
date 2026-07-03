@@ -13,7 +13,7 @@
 | SQLite 标准数据层 | 已有 raw fact、管理层、标的归一、账户归一、Lot / Allocation、税务试算 schema |
 | 数据校验 | 已有现金 / 持仓连续性校验、导入 gate 设计 |
 | Lot / Allocation | 已支持正股 / ETF、IPO、期权、基金、股票短仓 FIFO |
-| IPO 专项报告 | 已有 `tools/ipo_report_cli.py`，导出 Markdown + CSV，并区分中签已实现收益、未卖出 lot、未中签申购费和卖出费用审计 |
+| IPO 专项报告 | 已有 `tools/ipo_report_cli.py`，导出 Markdown + CSV，并区分中签已实现收益、未卖出 lot、未中签申购费、卖出费用审计和融资利息保守估计 |
 | 税务试算 | P0 级人民币试算层，需自行确认正式税务口径 |
 
 ## 快速开始
@@ -66,6 +66,7 @@ python tools/ipo_report_cli.py \
 - `reports/ipo/ipo-report.md`：IPO 专项审阅报告。
 - `reports/ipo/ipo_strategy_summary.csv`：IPO 策略口径摘要。
 - `reports/ipo/ipo_sale_allocations.csv`：IPO 后续卖出 allocation 和卖出费用审计。
+- `reports/ipo/ipo_financing_interest_summary.csv`：IPO 相关融资利息保守估计摘要。
 - `reports/ipo/*.csv`：IPO 现金腿、配发、lot、复核项明细。
 
 更完整的富途教程见 [docs/FUTU_QUICKSTART.md](docs/FUTU_QUICKSTART.md)。

@@ -380,11 +380,164 @@ def load_ipo_sale_allocations(
     return sale_rows
 
 
+def load_financing_interest_rows(
+    conn: sqlite3.Connection,
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    detail_rows: list[dict[str, Any]] = []
+    summary_by_currency: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "paid_cash_interest_expense": Decimal("0"),
+            "accrued_interest_expense": Decimal("0"),
+            "paid_cash_rows": 0,
+            "accrued_evidence_rows": 0,
+            "accrued_periods": 0,
+        }
+    )
+
+    clauses = []
+    params: list[Any] = []
+    if start_date:
+        clauses.append("replace(coalesce(cash_event_date, ''), '/', '-') >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("replace(coalesce(cash_event_date, ''), '/', '-') <= ?")
+        params.append(end_date)
+    paid_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    if table_exists(conn, "financing_interest_events"):
+        paid_rows = rows_as_dicts(
+            conn,
+            f"""
+            SELECT period, cash_event_date, currency, cash_amount,
+                   interest_type, period_label, source_refs
+            FROM financing_interest_events
+            {paid_where}
+            ORDER BY coalesce(cash_event_date, ''), period
+            """,
+            tuple(params),
+        )
+        for row in paid_rows:
+            currency = text(row.get("currency")) or "UNKNOWN"
+            cash_amount = dec(row.get("cash_amount"))
+            expense_amount = abs(cash_amount)
+            summary_by_currency[currency]["paid_cash_interest_expense"] = (
+                summary_by_currency[currency]["paid_cash_interest_expense"] + expense_amount
+            )
+            summary_by_currency[currency]["paid_cash_rows"] = int(summary_by_currency[currency]["paid_cash_rows"]) + 1
+            detail_rows.append(
+                {
+                    "record_type": "paid_cash_event",
+                    "period": row.get("period", ""),
+                    "date": row.get("cash_event_date", ""),
+                    "start_date": "",
+                    "end_date": "",
+                    "days": "",
+                    "currency": currency,
+                    "cash_amount": dbnum(cash_amount),
+                    "expense_amount": dbnum(expense_amount),
+                    "annual_rate_raw": "",
+                    "description": text(row.get("period_label")) or text(row.get("interest_type")),
+                    "source_refs": text(row.get("source_refs")),
+                }
+            )
+
+    clauses = []
+    params = []
+    if start_date:
+        clauses.append("replace(coalesce(evidence_date, ''), '/', '-') >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("replace(coalesce(evidence_date, ''), '/', '-') <= ?")
+        params.append(end_date)
+    evidence_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    if table_exists(conn, "financing_interest_evidence_items"):
+        period_rows = rows_as_dicts(
+            conn,
+            f"""
+            SELECT period, currency,
+                   MIN(evidence_date) AS start_date,
+                   MAX(evidence_date) AS end_date,
+                   COUNT(*) AS days,
+                   SUM(daily_interest) AS accrued_interest,
+                   MAX(cumulative_interest) AS max_cumulative_interest,
+                   GROUP_CONCAT(DISTINCT annual_rate_raw) AS annual_rate_raw
+            FROM financing_interest_evidence_items
+            {evidence_where}
+            GROUP BY period, currency
+            ORDER BY period, currency
+            """,
+            tuple(params),
+        )
+        for row in period_rows:
+            currency = text(row.get("currency")) or "UNKNOWN"
+            accrued_interest = abs(dec(row.get("accrued_interest")))
+            summary_by_currency[currency]["accrued_interest_expense"] = (
+                summary_by_currency[currency]["accrued_interest_expense"] + accrued_interest
+            )
+            summary_by_currency[currency]["accrued_evidence_rows"] = (
+                int(summary_by_currency[currency]["accrued_evidence_rows"]) + int(dec(row.get("days")))
+            )
+            summary_by_currency[currency]["accrued_periods"] = int(summary_by_currency[currency]["accrued_periods"]) + 1
+            detail_rows.append(
+                {
+                    "record_type": "accrued_daily_evidence_period",
+                    "period": row.get("period", ""),
+                    "date": "",
+                    "start_date": row.get("start_date", ""),
+                    "end_date": row.get("end_date", ""),
+                    "days": str(row.get("days", "")),
+                    "currency": currency,
+                    "cash_amount": "",
+                    "expense_amount": dbnum(accrued_interest),
+                    "annual_rate_raw": text(row.get("annual_rate_raw")),
+                    "description": f"daily interest evidence; max cumulative={dbnum(dec(row.get('max_cumulative_interest')))}",
+                    "source_refs": "",
+                }
+            )
+
+    summary_rows: list[dict[str, Any]] = []
+    for currency, values in sorted(summary_by_currency.items()):
+        paid = q2(values["paid_cash_interest_expense"])  # type: ignore[arg-type]
+        accrued = q2(values["accrued_interest_expense"])  # type: ignore[arg-type]
+        conservative = max(paid, accrued)
+        if paid == 0 and accrued == 0:
+            basis = "none"
+        elif accrued >= paid:
+            basis = "accrued_daily_evidence"
+        else:
+            basis = "paid_cash_events"
+        summary_rows.append(
+            {
+                "currency": currency,
+                "paid_cash_interest_expense": dbnum(paid),
+                "accrued_interest_expense": dbnum(accrued),
+                "conservative_interest_expense": dbnum(conservative),
+                "conservative_basis": basis,
+                "paid_cash_rows": str(values["paid_cash_rows"]),
+                "accrued_evidence_rows": str(values["accrued_evidence_rows"]),
+                "accrued_periods": str(values["accrued_periods"]),
+                "notes": "保守估计取 paid_cash 与 accrued_daily_evidence 中较大值；不分摊到单个 IPO lot。",
+            }
+        )
+    return summary_rows, detail_rows
+
+
+def primary_report_currency(cash_rows: list[dict[str, Any]], lot_rows: list[dict[str, Any]]) -> str:
+    currencies = {
+        text(row.get("currency"))
+        for row in [*cash_rows, *lot_rows]
+        if text(row.get("currency"))
+    }
+    return next(iter(currencies)) if len(currencies) == 1 else ""
+
+
 def build_strategy_summary(
     *,
     cash_rows: list[dict[str, Any]],
     lot_rows: list[dict[str, Any]],
     sale_rows: list[dict[str, Any]],
+    financing_summary_rows: list[dict[str, Any]],
     review_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     lot_codes = {text(row.get("ipo_code")) for row in lot_rows if text(row.get("ipo_code"))}
@@ -402,9 +555,16 @@ def build_strategy_summary(
         Decimal("0"),
     ))
     strategy_realized_pnl = q2(realized_pnl + cash_only_net_amount)
+    report_currency = primary_report_currency(cash_rows, lot_rows)
+    financing_summary_by_currency = {text(row.get("currency")): row for row in financing_summary_rows}
+    financing_row = financing_summary_by_currency.get(report_currency, {}) if report_currency else {}
+    paid_financing_interest = dec(financing_row.get("paid_cash_interest_expense"))
+    accrued_financing_interest = dec(financing_row.get("accrued_interest_expense"))
+    conservative_financing_interest = dec(financing_row.get("conservative_interest_expense"))
+    strategy_after_financing = q2(strategy_realized_pnl - conservative_financing_interest)
     open_lot_count = sum(1 for row in lot_rows if dec(row.get("remaining_quantity")) > 0)
     sold_lot_count = sum(1 for row in lot_rows if dec(row.get("sold_quantity")) > 0)
-    return [
+    rows = [
         {"metric": "matched_ipo_allotment_lots", "value": str(len(lot_rows)), "notes": "已形成 IPO allotment lot 的中签记录。"},
         {"metric": "sold_ipo_lots", "value": str(sold_lot_count), "notes": "已产生卖出 allocation 的 IPO lot 数。"},
         {"metric": "open_ipo_lots", "value": str(open_lot_count), "notes": "仍未卖出的 IPO lot 数；其成本不进入 realized PnL。"},
@@ -418,8 +578,27 @@ def build_strategy_summary(
         {"metric": "cash_only_ipo_net_amount", "value": dbnum(cash_only_net_amount), "notes": "没有中签 lot 的 IPO 现金净额；通常主要是未中签申购费。"},
         {"metric": "failed_application_fee_expense", "value": dbnum(failed_application_fee_expense), "notes": "未中签/无 lot IPO 的显式申购手续费支出。"},
         {"metric": "ipo_strategy_realized_pnl_after_cash_only", "value": dbnum(strategy_realized_pnl), "notes": "已卖出中签收益 + 无 lot IPO 现金净额；更接近打新策略已实现收益。"},
-        {"metric": "review_items", "value": str(len(review_items)), "notes": "需要人工理解或确认的报告项。"},
     ]
+    if report_currency:
+        rows.extend(
+            [
+                {"metric": "report_currency", "value": report_currency, "notes": "IPO 报告的主要币种；融资利息只在同币种下扣减。"},
+                {"metric": "paid_financing_interest_expense", "value": dbnum(paid_financing_interest), "notes": "区间内已实际扣款的账户级融资利息。"},
+                {"metric": "accrued_financing_interest_expense", "value": dbnum(accrued_financing_interest), "notes": "区间内按日息证据归属的账户级融资利息。"},
+                {"metric": "conservative_financing_interest_expense", "value": dbnum(conservative_financing_interest), "notes": "保守估计取已扣款融资利息与应计日息中的较大值，不分摊到单个 IPO lot。"},
+                {"metric": "ipo_strategy_realized_pnl_after_conservative_financing_interest", "value": dbnum(strategy_after_financing), "notes": "打新策略已实现收益 - 保守融资利息估计。"},
+            ]
+        )
+    else:
+        rows.append(
+            {
+                "metric": "ipo_strategy_realized_pnl_after_conservative_financing_interest",
+                "value": "",
+                "notes": "IPO 报告涉及多个币种，未自动合并扣减融资利息；请查看融资利息 CSV 按币种处理。",
+            }
+        )
+    rows.append({"metric": "review_items", "value": str(len(review_items)), "notes": "需要人工理解或确认的报告项。"})
+    return rows
 
 
 def build_review_items(
@@ -522,6 +701,8 @@ def build_report(
     lot_rows: list[dict[str, Any]],
     sale_rows: list[dict[str, Any]],
     strategy_summary: list[dict[str, Any]],
+    financing_summary_rows: list[dict[str, Any]],
+    financing_detail_rows: list[dict[str, Any]],
     review_items: list[dict[str, Any]],
 ) -> str:
     total_cost = sum((dec(row.get("cost_basis_total")) for row in lot_rows), Decimal("0"))
@@ -564,6 +745,29 @@ def build_report(
         "realized_pnl",
         "fee_source",
     ]
+    financing_summary_columns = [
+        "currency",
+        "paid_cash_interest_expense",
+        "accrued_interest_expense",
+        "conservative_interest_expense",
+        "conservative_basis",
+        "paid_cash_rows",
+        "accrued_evidence_rows",
+        "notes",
+    ]
+    financing_detail_columns = [
+        "record_type",
+        "period",
+        "date",
+        "start_date",
+        "end_date",
+        "days",
+        "currency",
+        "cash_amount",
+        "expense_amount",
+        "annual_rate_raw",
+        "description",
+    ]
     cash_columns = ["event_date", "ipo_code", "cash_leg_type", "currency", "amount", "description"]
     review_columns = ["severity", "check_code", "ipo_code", "message"]
     return "\n".join(
@@ -578,7 +782,17 @@ def build_report(
             "",
             md_table(strategy_summary, ["metric", "value", "notes"]),
             "",
-            "说明：`ipo_realized_pnl_from_sold_lots` 只统计已经卖出的中签 lot；`ipo_strategy_realized_pnl_after_cash_only` 会进一步扣除没有中签 lot 的 IPO 现金净额，通常更接近“打新策略已实现收益”。未卖出的 IPO lot 只列在 `open_lot_cost`，不进入已实现收益。",
+            "说明：`ipo_realized_pnl_from_sold_lots` 只统计已经卖出的中签 lot；`ipo_strategy_realized_pnl_after_cash_only` 会进一步扣除没有中签 lot 的 IPO 现金净额；`ipo_strategy_realized_pnl_after_conservative_financing_interest` 再扣除账户级融资利息的保守估计。未卖出的 IPO lot 只列在 `open_lot_cost`，不进入已实现收益。",
+            "",
+            "## IPO 融资利息保守估计",
+            "",
+            "融资利息来自账户级 margin interest，不静默分摊到单个 IPO lot。本报告保守取区间内已扣款融资利息和按日息证据归属融资利息中的较大值，用来估算 IPO 行为带来的融资成本压力。",
+            "",
+            md_table(financing_summary_rows, financing_summary_columns),
+            "",
+            "### 融资利息明细",
+            "",
+            md_table(financing_detail_rows, financing_detail_columns),
             "",
             "## IPO Allotment Lots",
             "",
@@ -608,6 +822,7 @@ def run_report(args: argparse.Namespace) -> dict[str, Any]:
         allocation_run_id = args.allocation_run_id or latest_allocation_run_id(conn)
         cash_rows = load_ipo_cash_legs(conn, args.start_date, args.end_date)
         asset_rows = load_ipo_asset_events(conn, args.start_date, args.end_date)
+        financing_summary_rows, financing_detail_rows = load_financing_interest_rows(conn, args.start_date, args.end_date)
         lot_rows = load_ipo_lots(conn, allocation_run_id)
         if args.start_date or args.end_date:
             start = args.start_date or "0000-00-00"
@@ -619,6 +834,7 @@ def run_report(args: argparse.Namespace) -> dict[str, Any]:
             cash_rows=cash_rows,
             lot_rows=lot_rows,
             sale_rows=sale_rows,
+            financing_summary_rows=financing_summary_rows,
             review_items=review_items,
         )
         report = build_report(
@@ -628,6 +844,8 @@ def run_report(args: argparse.Namespace) -> dict[str, Any]:
             lot_rows=lot_rows,
             sale_rows=sale_rows,
             strategy_summary=strategy_summary,
+            financing_summary_rows=financing_summary_rows,
+            financing_detail_rows=financing_detail_rows,
             review_items=review_items,
         )
 
@@ -686,6 +904,39 @@ def run_report(args: argparse.Namespace) -> dict[str, Any]:
             "trade_source_refs",
         ],
     )
+    write_csv(
+        output_dir / "ipo_financing_interest_summary.csv",
+        financing_summary_rows,
+        [
+            "currency",
+            "paid_cash_interest_expense",
+            "accrued_interest_expense",
+            "conservative_interest_expense",
+            "conservative_basis",
+            "paid_cash_rows",
+            "accrued_evidence_rows",
+            "accrued_periods",
+            "notes",
+        ],
+    )
+    write_csv(
+        output_dir / "ipo_financing_interest_details.csv",
+        financing_detail_rows,
+        [
+            "record_type",
+            "period",
+            "date",
+            "start_date",
+            "end_date",
+            "days",
+            "currency",
+            "cash_amount",
+            "expense_amount",
+            "annual_rate_raw",
+            "description",
+            "source_refs",
+        ],
+    )
     write_csv(output_dir / "ipo_strategy_summary.csv", strategy_summary, ["metric", "value", "notes"])
     write_csv(output_dir / "ipo_review_items.csv", review_items, ["severity", "check_code", "ipo_code", "message"])
     report_path = output_dir / "ipo-report.md"
@@ -701,6 +952,8 @@ def run_report(args: argparse.Namespace) -> dict[str, Any]:
         "asset_events": len(asset_rows),
         "ipo_lots": len(lot_rows),
         "sale_allocations": len(sale_rows),
+        "financing_interest_summary": financing_summary_rows,
+        "financing_interest_details": len(financing_detail_rows),
         "strategy_summary": summary_by_metric,
         "review_items": len(review_items),
     }
