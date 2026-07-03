@@ -56,9 +56,29 @@ python tools/ipo_report_cli.py \
 | `ipo_cash_legs.csv` | IPO 现金腿明细。 |
 | `ipo_asset_events.csv` | IPO 配发 / 资产变动明细。 |
 | `ipo_lots.csv` | IPO 中签 lot、成本组件、卖出收益摘要。 |
+| `ipo_sale_allocations.csv` | IPO lot 后续卖出 allocation、卖出净额和卖出费用估算。 |
+| `ipo_strategy_summary.csv` | 策略口径摘要，适合前端或二次分析直接读取。 |
 | `ipo_review_items.csv` | 待复核项和现金链路解释。 |
 
+报告中的标的名称会优先使用 `canonical_instruments` / `platform_instrument_mappings` 的归一名称；如果归一层还没有名称，才保留 parser 抽到的原始描述。
+
 ## 核对重点
+
+### 0. 先确认收益指标口径
+
+报告里会同时展示几类金额，不要混用：
+
+| 指标 | 含义 | 典型用途 |
+| --- | --- | --- |
+| `ipo_lot_total_cost` | 所有 IPO 中签 lot 的总成本，包含仍未卖出的 lot。 | 看中签 lot 总投入，不等于已实现成本。 |
+| `sold_lot_cost` | 已卖出的 IPO lot 对应成本。 | 计算已实现收益的成本侧。 |
+| `open_lot_cost` | 仍未卖出的 IPO lot 剩余成本。 | 校验持仓，不进入 realized PnL。 |
+| `net_sale_proceeds` | IPO lot 卖出后的净现金流入，通常已经扣掉卖出交易费用。 | 计算已实现收益的收入侧。 |
+| `realized_pnl_from_sold_lots` | 已卖出 IPO lot 的已实现收益。 | 看“中签并卖出”的收益。 |
+| `cash_only_ipo_net_amount` | 有 IPO 现金腿但没有中签 lot 的净额，通常是未中签申购费。 | 还原打新策略整体费用。 |
+| `ipo_strategy_realized_pnl_after_cash_only` | `realized_pnl_from_sold_lots + cash_only_ipo_net_amount`。 | 看“打新策略已实现收益”。 |
+
+如果报告里还有未卖出的 IPO lot，`ipo_net_sale_proceeds - ipo_lot_total_cost` 不是正确的已实现收益，因为它把未卖出的成本也扣进去了。应优先看 `realized_pnl_from_sold_lots`，如果要按打新策略口径扣除未中签申购费，再看 `ipo_strategy_realized_pnl_after_cash_only`。
 
 ### 1. 现金腿是否完整
 
@@ -110,13 +130,28 @@ explicit_handling_fee
 
 ```text
 remaining_quantity = 0
-sale_proceeds > 0
+net_sale_proceeds > 0
 realized_pnl != 0
 ```
 
 说明 IPO 中签 lot 已经和后续卖出交易形成完整收益闭环。
 
 如果 `remaining_quantity > 0`，说明该 IPO lot 仍持有或后续卖出数据缺失。
+
+### 5. 卖出交易成本是否算进去
+
+Lot / Allocation 使用的是卖出交易的净现金流，所以 `net_sale_proceeds` 和 `realized_pnl_from_sold_lots` 默认已经体现卖出交易费用。
+
+为了让审阅更清楚，报告还会输出 `ipo_sale_allocations.csv`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `net_sale_proceeds` | allocation 分摊到该 IPO lot 的卖出净现金流入。 |
+| `sell_fee_allocated_estimate` | 从 `market_trades.fee_total` 按成交数量分摊来的卖出费用估算。 |
+| `gross_sale_amount_estimate` | `net_sale_proceeds + sell_fee_allocated_estimate`，用于反查成交额。 |
+| `fee_source` | 费用来源。若为 `not_available`，说明当前库里没有足够的市场交易费用字段可审计。 |
+
+如果 `sell_fee_allocated_estimate = 0`，不要立刻理解成“没有交易费”。需要看 `fee_source`：如果是 `not_available`，代表报告无法独立还原卖出费用，但 allocation 的净额仍可能已经扣费。
 
 ## 当前边界
 
